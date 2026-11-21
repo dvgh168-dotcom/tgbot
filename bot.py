@@ -22,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultCachedVideo,
+    InputMediaAudio,
     InputMediaVideo,
 )
 from dotenv import load_dotenv
@@ -34,7 +35,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DATA_DIR = "data"
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
-TIKTOK_RE = re.compile(r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/\S+")
+
+# Ссылки: TikTok, Pinterest, X (Twitter), SoundCloud
+MEDIA_RE = re.compile(
+    r"https?://(?:www\.|m\.|vm\.|vt\.|mobile\.|on\.)?"
+    r"(?:tiktok\.com|pinterest\.[a-z.]+|pin\.it|twitter\.com|x\.com|soundcloud\.com)/\S+",
+    re.IGNORECASE,
+)
 
 # Максимум 4 одновременных скачивания, чтобы не перегружать VPS
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
@@ -76,7 +83,6 @@ def load_state_sync() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # Дополняем недостающие ключи, если файл старый
         for k, v in DEFAULT_STATE.items():
             if k not in data:
                 data[k] = json.loads(json.dumps(v))
@@ -149,6 +155,10 @@ def get_ad_payload() -> tuple[str | None, InlineKeyboardMarkup | None, bool]:
 
 def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+def is_soundcloud_url(url: str) -> bool:
+    return "soundcloud.com" in url.lower()
 
 
 def admin_menu_text() -> str:
@@ -227,23 +237,54 @@ async def init_loading_video():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def download_tiktok_sync(url: str) -> tuple[str, str]:
+def download_media_sync(url: str) -> dict:
     temp_dir = tempfile.mkdtemp()
-    out_template = os.path.join(temp_dir, "video.%(ext)s")
-    ydl_opts = {
-        "outtmpl": out_template,
-        "format": "mp4[filesize<50M]/best[ext=mp4][filesize<50M]/best[filesize<50M]/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    out_template = os.path.join(temp_dir, "media.%(ext)s")
+    audio_mode = is_soundcloud_url(url)
+
+    if audio_mode:
+        ydl_opts = {
+            "outtmpl": out_template,
+            "format": "bestaudio[filesize<48M]/bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+    else:
+        ydl_opts = {
+            "outtmpl": out_template,
+            "format": "bv*[ext=mp4][filesize<45M]+ba[ext=m4a]/b[ext=mp4][filesize<48M]/best[filesize<48M]/best",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        files = os.listdir(temp_dir)
+            info = ydl.extract_info(url, download=True) or {}
+
+        files = [f for f in os.listdir(temp_dir) if not f.endswith(".part")]
         if not files:
             raise RuntimeError("Файл не был скачан")
-        return os.path.join(temp_dir, files[0]), temp_dir
+
+        preferred_ext = ".mp3" if audio_mode else ".mp4"
+        chosen = next((f for f in files if f.lower().endswith(preferred_ext)), files[0])
+
+        return {
+            "path": os.path.join(temp_dir, chosen),
+            "temp_dir": temp_dir,
+            "is_audio": audio_mode,
+            "title": info.get("track") or info.get("title"),
+            "performer": info.get("artist") or info.get("uploader"),
+        }
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
@@ -254,7 +295,7 @@ async def notify_admin(url: str, error: Exception):
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"⚠️ <b>Ошибка скачивания TikTok</b>\n\n"
+                f"⚠️ <b>Ошибка скачивания</b>\n\n"
                 f"Ссылка: {url}\n"
                 f"Ошибка: <code>{str(error)[:500]}</code>",
             )
@@ -337,7 +378,7 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
     elif action == "btn":
         await state.set_state(AdminStates.waiting_ad_button)
         await callback.message.edit_text(
-            "🔗 <b>Настройка кнопки под видео</b>\n\n"
+            "🔗 <b>Настройка кнопки под медиа</b>\n\n"
             "Отправь текст и ссылку через вертикальную черту:\n"
             "<code>⚡ ВСЕ СКИДКИ ТУТ | https://t.me/твой_канал</code>\n\n"
             "Чтобы полностью отключить кнопку, отправь <code>0</code>.",
@@ -441,7 +482,8 @@ async def cmd_start(message: types.Message):
     await register_user(message.from_user.id)
     me = await bot.get_me()
     await message.answer(
-        f"👋 Привет! Я качаю видео из TikTok без водяного знака.\n\n"
+        f"👋 Привет! Я скачиваю видео и музыку без водяных знаков.\n\n"
+        f"<b>Поддерживаются:</b> TikTok, Pinterest, X (Twitter) и SoundCloud.\n\n"
         f"• Отправь ссылку прямо сюда\n"
         f"• Или введи <code>@{me.username} ссылка</code> в любом чате!"
     )
@@ -450,51 +492,67 @@ async def cmd_start(message: types.Message):
 @dp.message(F.text)
 async def handle_direct_link(message: types.Message):
     await register_user(message.from_user.id)
-    match = TIKTOK_RE.search(message.text or "")
+    match = MEDIA_RE.search(message.text or "")
     if not match:
         return
 
     url = match.group(0)
-    status_msg = await message.answer("⏳ Загружаю видео...")
-    temp_dir = None
+    status_msg = await message.answer("⏳ Загружаю...")
+    media = None
     try:
         async with DOWNLOAD_SEMAPHORE:
-            file_path, temp_dir = await asyncio.to_thread(download_tiktok_sync, url)
+            media = await asyncio.to_thread(download_media_sync, url)
+
         caption, kb, ad_shown = get_ad_payload()
-        await message.answer_video(
-            video=FSInputFile(file_path),
-            caption=caption,
-            reply_markup=kb,
-        )
+        if media["is_audio"]:
+            await message.answer_audio(
+                audio=FSInputFile(media["path"]),
+                title=media["title"],
+                performer=media["performer"],
+                caption=caption,
+                reply_markup=kb,
+            )
+        else:
+            await message.answer_video(
+                video=FSInputFile(media["path"]),
+                caption=caption,
+                reply_markup=kb,
+            )
+
         await record_download("dm", ad_shown)
         await status_msg.delete()
     except Exception as e:
-        await status_msg.edit_text("❌ Не удалось скачать это видео.")
+        await status_msg.edit_text("❌ Не удалось скачать по этой ссылке.")
         await notify_admin(url, e)
     finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if media and media.get("temp_dir"):
+            shutil.rmtree(media["temp_dir"], ignore_errors=True)
 
 
 # ==================== ИНЛАЙН-РЕЖИМ В ЛЮБЫХ ЧАТАХ ====================
 
 @dp.inline_query()
 async def handle_inline_query(query: types.InlineQuery):
-    match = TIKTOK_RE.search(query.query or "")
+    match = MEDIA_RE.search(query.query or "")
     if not match or not LOADING_VIDEO_ID:
         await query.answer([], cache_time=1)
         return
 
+    url = match.group(0)
+    is_audio = is_soundcloud_url(url)
+    title = "🎵 Поделиться треком из SoundCloud" if is_audio else "💌 Поделиться видео"
+    loading_text = "⏳ Загрузка трека..." if is_audio else "⏳ Загрузка видео..."
+
     loading_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ Загрузка видео...", callback_data="loading")]
+            [InlineKeyboardButton(text=loading_text, callback_data="loading")]
         ]
     )
     result = InlineQueryResultCachedVideo(
         id=uuid.uuid4().hex[:16],
         video_file_id=LOADING_VIDEO_ID,
-        title="💌 Поделиться видео из TikTok",
-        caption="⏳ Загружаю видео...",
+        title=title,
+        caption=loading_text,
         reply_markup=loading_kb,
     )
     await query.answer([result], cache_time=1, is_personal=True)
@@ -505,25 +563,42 @@ async def handle_chosen_inline(result: types.ChosenInlineResult):
     if not result.inline_message_id:
         return
 
-    match = TIKTOK_RE.search(result.query or "")
+    match = MEDIA_RE.search(result.query or "")
     if not match:
         return
 
     url = match.group(0)
-    temp_dir = None
+    media = None
     try:
         async with DOWNLOAD_SEMAPHORE:
-            file_path, temp_dir = await asyncio.to_thread(download_tiktok_sync, url)
-
-        sent = await bot.send_video(
-            chat_id=STORAGE_CHAT_ID, video=FSInputFile(file_path)
-        )
-        file_id = sent.video.file_id
+            media = await asyncio.to_thread(download_media_sync, url)
 
         caption, kb, ad_shown = get_ad_payload()
+        if media["is_audio"]:
+            sent = await bot.send_audio(
+                chat_id=STORAGE_CHAT_ID,
+                audio=FSInputFile(media["path"]),
+                title=media["title"],
+                performer=media["performer"],
+            )
+            file_id = sent.audio.file_id
+            input_media = InputMediaAudio(
+                media=file_id,
+                caption=caption,
+                title=media["title"],
+                performer=media["performer"],
+            )
+        else:
+            sent = await bot.send_video(
+                chat_id=STORAGE_CHAT_ID,
+                video=FSInputFile(media["path"]),
+            )
+            file_id = sent.video.file_id
+            input_media = InputMediaVideo(media=file_id, caption=caption)
+
         await bot.edit_message_media(
             inline_message_id=result.inline_message_id,
-            media=InputMediaVideo(media=file_id, caption=caption),
+            media=input_media,
             reply_markup=kb,
         )
         await bot.delete_message(chat_id=STORAGE_CHAT_ID, message_id=sent.message_id)
@@ -533,18 +608,18 @@ async def handle_chosen_inline(result: types.ChosenInlineResult):
         try:
             await bot.edit_message_caption(
                 inline_message_id=result.inline_message_id,
-                caption="❌ Не удалось загрузить видео.",
+                caption="❌ Не удалось загрузить файл.",
             )
         except Exception:
             pass
     finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if media and media.get("temp_dir"):
+            shutil.rmtree(media["temp_dir"], ignore_errors=True)
 
 
 @dp.callback_query(F.data == "loading")
 async def handle_loading_click(callback: types.CallbackQuery):
-    await callback.answer("Видео загружается, подождите 2–3 секунды...", show_alert=False)
+    await callback.answer("Загружаю файл, подождите пару секунд...", show_alert=False)
 
 
 async def main():
