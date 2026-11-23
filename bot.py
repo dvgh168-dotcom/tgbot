@@ -8,18 +8,20 @@ import subprocess
 import tempfile
 import uuid
 from collections import OrderedDict
-from datetime import date
+from datetime import date, datetime
+from io import BytesIO
 
 import aiohttp
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -27,9 +29,11 @@ from aiogram.types import (
     InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
+    InputSticker,
     InputTextMessageContent,
 )
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 
 load_dotenv()
 
@@ -52,7 +56,7 @@ SEARCH_SEMAPHORE = asyncio.Semaphore(5)
 STATE_LOCK = asyncio.Lock()
 BOT_USERNAME = ""
 
-# Кэш найденных треков SoundCloud: key -> url (храним последние 1000 запросов)
+# Кэш найденных треков SoundCloud: key -> url
 SEARCH_CACHE: OrderedDict[str, str] = OrderedDict()
 
 logging.basicConfig(level=logging.INFO)
@@ -67,10 +71,21 @@ class AdminStates(StatesGroup):
     waiting_custom_icon = State()
 
 
+class StickerStates(StatesGroup):
+    waiting_pack_title = State()
+    waiting_first_item = State()
+    waiting_add_item = State()
+    waiting_grid_size = State()
+    waiting_grid_photo = State()
+    waiting_rename = State()
+    waiting_delete_sticker = State()
+
+
 DEFAULT_TEXTS = {
     "start_text": (
-        "👋 Привет! Я скачиваю видео, фото и музыку без водяных знаков.\n\n"
-        "<b>Поддерживаются:</b> TikTok, Pinterest (видео и фото), X (Twitter) и SoundCloud.\n\n"
+        "👋 Привет! Я скачиваю видео, фото и музыку без водяных знаков, "
+        "а ещё помогаю собирать свои стикерпаки и сетки премиум-эмодзи.\n\n"
+        "<b>Загрузка медиа:</b> TikTok, Pinterest (видео и фото), X (Twitter) и SoundCloud.\n\n"
         "• Отправь ссылку или название трека прямо сюда\n"
         "• Или введи <code>@{username} ссылка / название трека</code> в любом чате!"
     ),
@@ -134,9 +149,12 @@ DEFAULT_STATE = {
         "today_dm": 0,
         "today_users": [],
         "ad_impressions": 0,
+        "packs_created": 0,
     },
     "users": [],
     "all_users": [],
+    "sticker_packs": {},
+    "premium_users": {},
 }
 
 
@@ -226,6 +244,22 @@ async def record_download(source: str, ad_shown: bool, user_id: int | None = Non
     await save_state()
 
 
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+def has_premium(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    exp_str = STATE.get("premium_users", {}).get(str(user_id))
+    if not exp_str:
+        return False
+    try:
+        return datetime.fromisoformat(exp_str) > datetime.utcnow()
+    except Exception:
+        return False
+
+
 def cache_search_url(url: str) -> str:
     key = uuid.uuid4().hex[:12]
     SEARCH_CACHE[key] = url
@@ -256,8 +290,9 @@ def detect_platform_key(url: str) -> str:
     return "tiktok"
 
 
-def get_media_payload(source_url: str) -> tuple[str | None, InlineKeyboardMarkup | None, bool]:
-    caption = STATE["ad_text"] if (STATE["ad_enabled"] and STATE["ad_text"]) else None
+def get_media_payload(source_url: str, user_id: int | None = None) -> tuple[str | None, InlineKeyboardMarkup | None, bool]:
+    is_prem = has_premium(user_id) if user_id else False
+    caption = None if is_prem else (STATE["ad_text"] if (STATE["ad_enabled"] and STATE["ad_text"]) else None)
     kb = None
     if STATE.get("source_btn_enabled", True) and source_url:
         pkey = detect_platform_key(source_url)
@@ -268,10 +303,6 @@ def get_media_payload(source_url: str) -> tuple[str | None, InlineKeyboardMarkup
             )
     ad_shown = bool(caption)
     return caption, kb, ad_shown
-
-
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
 def is_soundcloud_url(url: str) -> bool:
@@ -286,6 +317,709 @@ def is_pinterest_url(url: str) -> bool:
 def detect_platform_ui(url: str) -> tuple[str, str]:
     pkey = detect_platform_key(url)
     return STATE["texts"][f"title_{pkey}"], STATE["icons"][pkey]
+
+
+def start_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎨 Стикеры и Эмодзи", callback_data="stk:menu")]
+        ]
+    )
+
+
+# ==================== ОБРАБОТКА КАРТИНОК ДЛЯ СТИКЕРОВ И ЭМОДЗИ ====================
+
+def format_pack_title(raw_title: str, is_premium: bool) -> str:
+    clean = raw_title.strip()
+    if is_premium or not BOT_USERNAME:
+        return clean[:64]
+    suffix = f" • @{BOT_USERNAME}"
+    max_len = 64 - len(suffix)
+    return (clean[:max_len].strip() or "Pack") + suffix
+
+
+def make_pack_short_name() -> str:
+    return f"p{uuid.uuid4().hex[:10]}_by_{BOT_USERNAME}"
+
+
+def get_user_packs(user_id: int) -> list[dict]:
+    return STATE.setdefault("sticker_packs", {}).setdefault(str(user_id), [])
+
+
+def find_user_pack(user_id: int, pack_name: str) -> dict | None:
+    for p in get_user_packs(user_id):
+        if p["name"] == pack_name:
+            return p
+    return None
+
+
+def image_to_sticker_png_sync(raw_bytes: bytes, is_emoji: bool) -> bytes:
+    img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+    if is_emoji:
+        resized = ImageOps.contain(img, (100, 100), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+        offset = ((100 - resized.width) // 2, (100 - resized.height) // 2)
+        canvas.paste(resized, offset, resized)
+        out_img = canvas
+    else:
+        # Для обычного стикера одна сторона должна быть ровно 512px, вторая <= 512px
+        out_img = ImageOps.contain(img, (512, 512), Image.Resampling.LANCZOS)
+
+    buf = BytesIO()
+    out_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def slice_image_grid_sync(raw_bytes: bytes, cols: int, rows: int, is_emoji: bool) -> list[bytes]:
+    tile_size = 100 if is_emoji else 512
+    target_w = cols * tile_size
+    target_h = rows * tile_size
+
+    img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+    fitted = ImageOps.contain(img, (target_w, target_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    offset = ((target_w - fitted.width) // 2, (target_h - fitted.height) // 2)
+    canvas.paste(fitted, offset, fitted)
+
+    tiles = []
+    for r in range(rows):
+        for c in range(cols):
+            box = (c * tile_size, r * tile_size, (c + 1) * tile_size, (r + 1) * tile_size)
+            tile = canvas.crop(box)
+            buf = BytesIO()
+            tile.save(buf, format="PNG")
+            tiles.append(buf.getvalue())
+    return tiles
+
+
+async def extract_images_from_message(message: types.Message) -> tuple[list[tuple[bytes, str]], str | None]:
+    """
+    Возвращает ([(bytes, emoji), ...], error_text_or_None).
+    Поддерживает фото, картинки-документы, статичные стикеры и статичные кастомные эмодзи.
+    """
+    items: list[tuple[bytes, str]] = []
+
+    if message.photo:
+        io_obj = await bot.download(message.photo[-1])
+        items.append((io_obj.read(), "😀"))
+        return items, None
+
+    if message.document:
+        mime = (message.document.mime_type or "").lower()
+        if mime.startswith("image/"):
+            io_obj = await bot.download(message.document)
+            items.append((io_obj.read(), "😀"))
+            return items, None
+        return [], "❌ Отправь картинку (PNG/JPG/WEBP), а не другой файл."
+
+    if message.sticker:
+        if message.sticker.is_animated or message.sticker.is_video:
+            return [], "❌ Пока поддерживаются только статичные стикеры и картинки (без анимации и видео)."
+        io_obj = await bot.download(message.sticker)
+        items.append((io_obj.read(), message.sticker.emoji or "😀"))
+        return items, None
+
+    if message.entities:
+        emoji_ids = [
+            e.custom_emoji_id
+            for e in message.entities
+            if e.type == "custom_emoji" and e.custom_emoji_id
+        ]
+        if emoji_ids:
+            stickers = await bot.get_custom_emoji_stickers(emoji_ids[:20])
+            skipped = 0
+            for st in stickers:
+                if st.is_animated or st.is_video:
+                    skipped += 1
+                    continue
+                io_obj = await bot.download(st)
+                items.append((io_obj.read(), st.emoji or "😀"))
+            if not items:
+                return [], "❌ Все отправленные эмодзи анимированные. Пока поддерживаются только статичные."
+            return items, None
+
+    return [], "❌ Отправь картинку (фото/файл), статичный стикер или статичный премиум-эмодзи."
+
+
+# ==================== МЕНЮ КОНСТРУКТОРА СТИКЕРОВ ====================
+
+def sticker_main_menu_text() -> str:
+    return (
+        "🎨 <b>Конструктор стикеров и эмодзи</b>\n\n"
+        "Создавай свои стикерпаки, копируй чужие стикеры и нарезай картинки "
+        "на цельные мозаики для <b>Telegram Premium</b>."
+    )
+
+
+def sticker_main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Создать новый набор", callback_data="stk:new")],
+            [
+                InlineKeyboardButton(text="🧩 Мои стикеры", callback_data="stk:list:regular"),
+                InlineKeyboardButton(text="😀 Мои эмодзи", callback_data="stk:list:custom_emoji"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В начало", callback_data="stk:home")],
+        ]
+    )
+
+
+def pack_list_kb(user_id: int, ptype: str) -> InlineKeyboardMarkup:
+    packs = [p for p in get_user_packs(user_id) if p["type"] == ptype]
+    rows = []
+    for p in packs:
+        badge = "💎 " if p.get("is_premium") else ""
+        rows.append([InlineKeyboardButton(text=f"{badge}{p['title']}", callback_data=f"stkp:{p['name']}")])
+    rows.append([InlineKeyboardButton(text="🆕 Создать набор", callback_data=f"stk:new_type:{ptype}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="stk:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pack_card_text(pack: dict) -> str:
+    type_label = "Премиум-эмодзи" if pack["type"] == "custom_emoji" else "Стикеры"
+    prem_line = "💎 <b>Это премиум набор</b> <i>(без подписи бота)</i>" if pack.get("is_premium") else "🔴 <b>Премиум не подключён</b> <i>(в названии указан бот)</i>"
+    return (
+        f"🧿 <b>Название:</b> {pack['title']}\n"
+        f"📂 <b>Тип:</b> {type_label}\n\n"
+        f"{prem_line}"
+    )
+
+
+def pack_card_kb(pack: dict) -> InlineKeyboardMarkup:
+    name = pack["name"]
+    rows = []
+    if not pack.get("is_premium"):
+        rows.append([InlineKeyboardButton(text="🆙 Улучшить набор (скоро за ⭐)", callback_data=f"stka:prem:{name}")])
+    rows.append([InlineKeyboardButton(text="👀 Посмотреть набор", url=f"https://t.me/addstickers/{name}")])
+    rows.append([InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"stka:rename:{name}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data=f"stka:add:{name}"),
+            InlineKeyboardButton(text="➖ Удалить", callback_data=f"stka:del_one:{name}"),
+        ]
+    )
+    if pack["type"] == "custom_emoji":
+        rows.append([InlineKeyboardButton(text="🧩 Нарезать фото в сетку", callback_data=f"stka:grid:{name}")])
+    rows.append([InlineKeyboardButton(text="❌ Удалить набор", callback_data=f"stka:del_pack:{name}")])
+    back_cb = f"stk:list:{pack['type']}"
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def grid_presets_kb(back_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="4×2 (8 шт)", callback_data="stkgrid:4x2"),
+                InlineKeyboardButton(text="5×2 (10 шт)", callback_data="stkgrid:5x2"),
+                InlineKeyboardButton(text="6×3 (18 шт)", callback_data="stkgrid:6x3"),
+            ],
+            [
+                InlineKeyboardButton(text="8×2 (16 шт)", callback_data="stkgrid:8x2"),
+                InlineKeyboardButton(text="8×3 (24 шт)", callback_data="stkgrid:8x3"),
+                InlineKeyboardButton(text="8×4 (32 шт)", callback_data="stkgrid:8x4"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=back_cb)],
+        ]
+    )
+
+
+# ==================== ОБРАБОТЧИКИ КОНСТРУКТОРА ====================
+
+@dp.message(Command("stickers"))
+async def cmd_stickers(message: types.Message, state: FSMContext):
+    await register_user(message.from_user.id, is_dm=True)
+    await state.clear()
+    await message.answer(sticker_main_menu_text(), reply_markup=sticker_main_menu_kb())
+
+
+@dp.callback_query(F.data == "stk:home")
+async def cb_stk_home(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = STATE["texts"]["start_text"].replace("{username}", BOT_USERNAME)
+    await callback.message.edit_text(text, reply_markup=start_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stk:menu")
+async def cb_stk_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(sticker_main_menu_text(), reply_markup=sticker_main_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stk:new")
+async def cb_stk_new(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧩 Обычные стикеры", callback_data="stk:new_type:regular")],
+            [InlineKeyboardButton(text="😀 Премиум-эмодзи (и нарезка сеток)", callback_data="stk:new_type:custom_emoji")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="stk:menu")],
+        ]
+    )
+    await callback.message.edit_text(
+        "🆕 <b>Выбери тип нового набора:</b>\n\n"
+        "• <b>Обычные стикеры</b> — крупные стикеры `512×512` для чатов\n"
+        "• <b>Премиум-эмодзи</b> — мини-иконки `100×100` и нарезка картинок в мозаику",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stk:new_type:"))
+async def cb_stk_new_type(callback: types.CallbackQuery, state: FSMContext):
+    ptype = callback.data.split(":", 2)[2]
+    await state.set_state(StickerStates.waiting_pack_title)
+    await state.update_data(new_pack_type=ptype)
+    label = "эмодзи-набора" if ptype == "custom_emoji" else "стикерпака"
+    await callback.message.edit_text(
+        f"✏️ <b>Введи название для нового {label}:</b>\n\n"
+        "<i>Например: Мои мемы или Эстетика</i>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="stk:menu")]]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.message(StickerStates.waiting_pack_title, F.text)
+async def msg_pack_title(message: types.Message, state: FSMContext):
+    raw_title = (message.text or "").strip()
+    if not raw_title or raw_title.startswith("/"):
+        await message.answer("❌ Напиши обычное текстовое название (до 45 символов).")
+        return
+
+    data = await state.get_data()
+    ptype = data.get("new_pack_type", "regular")
+    await state.update_data(new_pack_title=raw_title[:45])
+    await state.set_state(StickerStates.waiting_first_item)
+
+    rows = []
+    if ptype == "custom_emoji":
+        rows.append([InlineKeyboardButton(text="🧩 Нарезать фото в сетку", callback_data="stk:first_grid")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="stk:menu")])
+
+    extra = "\n\nИли нажми <b>«🧩 Нарезать фото в сетку»</b>, чтобы сразу разбить картинку на мозаику." if ptype == "custom_emoji" else ""
+    await message.answer(
+        f"📸 <b>Отправь первую картинку или стикер</b>, чтобы создать набор «{raw_title[:45]}».\n"
+        f"Можно прислать фото, картинку файлом, чужой статичный стикер или статичный премиум-эмодзи.{extra}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "stk:first_grid")
+async def cb_first_grid(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("new_pack_title"):
+        await callback.answer("Сначала выбери создание набора", show_alert=True)
+        return
+    await state.set_state(StickerStates.waiting_grid_size)
+    await state.update_data(grid_mode="create_new")
+    await callback.message.edit_text(
+        "🧩 <b>Выбери размер сетки (ширина × высота):</b>\n\n"
+        "В Telegram панель эмодзи вмещает <b>8 штук в ряд</b> — для широких баннеров бери <code>8×2</code>, <code>8×3</code> или <code>8×4</code>.\n"
+        "Можешь нажать кнопку ниже или написать свой размер, например <code>7x3</code> (от 2×1 до 8×6).",
+        reply_markup=grid_presets_kb("stk:menu"),
+    )
+    await callback.answer()
+
+
+@dp.message(StickerStates.waiting_first_item)
+async def msg_first_item(message: types.Message, state: FSMContext):
+    items, err = await extract_images_from_message(message)
+    if err:
+        await message.answer(err)
+        return
+
+    data = await state.get_data()
+    ptype = data.get("new_pack_type", "regular")
+    raw_title = data.get("new_pack_title", "My Pack")
+    is_emoji = ptype == "custom_emoji"
+    is_prem = has_premium(message.from_user.id)
+
+    short_name = make_pack_short_name()
+    full_title = format_pack_title(raw_title, is_prem)
+
+    wait_msg = await message.answer("⏳ Создаю набор...")
+    try:
+        input_stickers = []
+        for idx, (raw_bytes, emoji) in enumerate(items[:50]):
+            png_bytes = await asyncio.to_thread(image_to_sticker_png_sync, raw_bytes, is_emoji)
+            input_stickers.append(
+                InputSticker(
+                    sticker=BufferedInputFile(png_bytes, filename=f"s{idx}.png"),
+                    emoji_list=[emoji],
+                    format="static",
+                )
+            )
+
+        await bot.create_new_sticker_set(
+            user_id=message.from_user.id,
+            name=short_name,
+            title=full_title,
+            stickers=input_stickers,
+            sticker_type=ptype,
+        )
+
+        pack_obj = {
+            "name": short_name,
+            "title": raw_title,
+            "type": ptype,
+            "is_premium": is_prem,
+        }
+        get_user_packs(message.from_user.id).append(pack_obj)
+        STATE["stats"]["packs_created"] = STATE["stats"].get("packs_created", 0) + 1
+        await save_state()
+        await state.clear()
+
+        await wait_msg.edit_text(
+            f"✅ <b>Набор создан!</b>\n\n{pack_card_text(pack_obj)}",
+            reply_markup=pack_card_kb(pack_obj),
+        )
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Не удалось создать набор: <code>{str(e)[:300]}</code>")
+
+
+@dp.callback_query(F.data.startswith("stk:list:"))
+async def cb_stk_list(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    ptype = callback.data.split(":", 2)[2]
+    header = "😀 <b>Мои эмодзи</b>" if ptype == "custom_emoji" else "🧩 <b>Мои стикеры</b>"
+    packs = [p for p in get_user_packs(callback.from_user.id) if p["type"] == ptype]
+    body = f"{header}\n\nВыбери набор для управления:" if packs else f"{header}\n\nУ тебя пока нет созданных наборов."
+    await callback.message.edit_text(body, reply_markup=pack_list_kb(callback.from_user.id, ptype))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stkp:"))
+async def cb_open_pack(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    pack_name = callback.data.split(":", 1)[1]
+    pack = find_user_pack(callback.from_user.id, pack_name)
+    if not pack:
+        await callback.answer("Набор не найден", show_alert=True)
+        return
+    await callback.message.edit_text(pack_card_text(pack), reply_markup=pack_card_kb(pack))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stka:"))
+async def cb_pack_action(callback: types.CallbackQuery, state: FSMContext):
+    _, action, pack_name = callback.data.split(":", 2)
+    pack = find_user_pack(callback.from_user.id, pack_name)
+    if not pack:
+        await callback.answer("Набор не найден", show_alert=True)
+        return
+
+    back_to_pack = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к набору", callback_data=f"stkp:{pack_name}")]]
+    )
+
+    if action == "prem":
+        await callback.answer(
+            "Оплата улучшения набора через Telegram Stars появится в следующем обновлении!",
+            show_alert=True,
+        )
+        return
+
+    elif action == "rename":
+        await state.set_state(StickerStates.waiting_rename)
+        await state.update_data(active_pack=pack_name)
+        await callback.message.edit_text(
+            f"✏️ <b>Введи новое название для набора «{pack['title']}»:</b>",
+            reply_markup=back_to_pack,
+        )
+        await callback.answer()
+
+    elif action == "add":
+        await state.set_state(StickerStates.waiting_add_item)
+        await state.update_data(active_pack=pack_name)
+        await callback.message.edit_text(
+            f"➕ <b>Добавление в набор «{pack['title']}»</b>\n\n"
+            "Отправляй картинки (фото/файлы), чужие статичные стикеры или статичные эмодзи — "
+            "можно сразу несколько подряд.\n\nКогда закончишь, нажми кнопку ниже.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"stkp:{pack_name}")]]
+            ),
+        )
+        await callback.answer()
+
+    elif action == "grid":
+        await state.set_state(StickerStates.waiting_grid_size)
+        await state.update_data(grid_mode="add_existing", active_pack=pack_name)
+        await callback.message.edit_text(
+            f"🧩 <b>Нарезка фото в сетку для «{pack['title']}»</b>\n\n"
+            "Выбери размер сетки (ширина × высота) кнопкой или напиши вручную, например <code>7x3</code> (макс. 8×6):",
+            reply_markup=grid_presets_kb(f"stkp:{pack_name}"),
+        )
+        await callback.answer()
+
+    elif action == "del_one":
+        await state.set_state(StickerStates.waiting_delete_sticker)
+        await state.update_data(active_pack=pack_name)
+        await callback.message.edit_text(
+            f"➖ <b>Удаление из набора «{pack['title']}»</b>\n\n"
+            "Отправь сюда стикер или эмодзи <b>из этого набора</b>, который нужно удалить.",
+            reply_markup=back_to_pack,
+        )
+        await callback.answer()
+
+    elif action == "del_pack":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Да, удалить навсегда", callback_data=f"stka:del_confirm:{pack_name}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"stkp:{pack_name}")],
+            ]
+        )
+        await callback.message.edit_text(
+            f"⚠️ Точно удалить набор <b>«{pack['title']}»</b>? Это действие нельзя отменить.",
+            reply_markup=kb,
+        )
+        await callback.answer()
+
+    elif action == "del_confirm":
+        try:
+            await bot.delete_sticker_set(name=pack_name)
+        except Exception:
+            pass
+        packs = get_user_packs(callback.from_user.id)
+        STATE["sticker_packs"][str(callback.from_user.id)] = [p for p in packs if p["name"] != pack_name]
+        await save_state()
+        await callback.message.edit_text(
+            f"🗑 Набор <b>«{pack['title']}»</b> удалён.",
+            reply_markup=pack_list_kb(callback.from_user.id, pack["type"]),
+        )
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("stkgrid:"), StickerStates.waiting_grid_size)
+async def cb_grid_preset(callback: types.CallbackQuery, state: FSMContext):
+    size_str = callback.data.split(":", 1)[1]
+    cols, rows = [int(x) for x in size_str.split("x")]
+    await state.update_data(grid_cols=cols, grid_rows=rows)
+    await state.set_state(StickerStates.waiting_grid_photo)
+    data = await state.get_data()
+    back_cb = f"stkp:{data['active_pack']}" if data.get("grid_mode") == "add_existing" else "stk:menu"
+    await callback.message.edit_text(
+        f"📸 <b>Сетка {cols}×{rows} ({cols * rows} шт.) выбрана.</b>\n\n"
+        "Теперь отправь картинку (как фото или файл PNG/JPG) — я аккуратно нарежу её и залью в набор.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.message(StickerStates.waiting_grid_size, F.text)
+async def msg_grid_custom_size(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip().lower().replace("х", "x").replace("*", "x").replace(" ", "")
+    m = re.fullmatch(r"(\d+)x(\d+)", txt)
+    if not m:
+        await message.answer("❌ Напиши размер в формате <code>8x3</code> (ширина×высота) или выбери кнопку выше.")
+        return
+    cols, rows = int(m.group(1)), int(m.group(2))
+    if not (1 <= cols <= 8 and 1 <= rows <= 6) or (cols * rows < 2):
+        await message.answer("❌ Допустимый размер: ширина от 1 до 8, высота от 1 до 6 (минимум 2 плитки).")
+        return
+
+    await state.update_data(grid_cols=cols, grid_rows=rows)
+    await state.set_state(StickerStates.waiting_grid_photo)
+    await message.answer(
+        f"📸 <b>Сетка {cols}×{rows} ({cols * rows} шт.) выбрана.</b>\n\n"
+        "Теперь отправь картинку (как фото или файл PNG/JPG)."
+    )
+
+
+@dp.message(StickerStates.waiting_grid_photo)
+async def msg_grid_photo(message: types.Message, state: FSMContext):
+    items, err = await extract_images_from_message(message)
+    if err or not items:
+        await message.answer(err or "❌ Отправь картинку (фото или файл).")
+        return
+
+    data = await state.get_data()
+    cols = data.get("grid_cols", 8)
+    rows = data.get("grid_rows", 2)
+    mode = data.get("grid_mode", "create_new")
+    raw_bytes = items[0][0]
+
+    wait_msg = await message.answer(f"⏳ Нарезаю картинку на {cols * rows} фрагментов и загружаю в Telegram...")
+    try:
+        tiles = await asyncio.to_thread(slice_image_grid_sync, raw_bytes, cols, rows, True)
+
+        if mode == "create_new":
+            raw_title = data.get("new_pack_title", "Emoji Grid")
+            is_prem = has_premium(message.from_user.id)
+            short_name = make_pack_short_name()
+            full_title = format_pack_title(raw_title, is_prem)
+
+            input_stickers = [
+                InputSticker(
+                    sticker=BufferedInputFile(tile_bytes, filename=f"t{i}.png"),
+                    emoji_list=["✨"],
+                    format="static",
+                )
+                for i, tile_bytes in enumerate(tiles)
+            ]
+            await bot.create_new_sticker_set(
+                user_id=message.from_user.id,
+                name=short_name,
+                title=full_title,
+                stickers=input_stickers,
+                sticker_type="custom_emoji",
+            )
+            pack_obj = {
+                "name": short_name,
+                "title": raw_title,
+                "type": "custom_emoji",
+                "is_premium": is_prem,
+            }
+            get_user_packs(message.from_user.id).append(pack_obj)
+            STATE["stats"]["packs_created"] = STATE["stats"].get("packs_created", 0) + 1
+            await save_state()
+        else:
+            pack_name = data["active_pack"]
+            pack_obj = find_user_pack(message.from_user.id, pack_name)
+            if not pack_obj:
+                await wait_msg.edit_text("❌ Набор не найден.")
+                await state.clear()
+                return
+            for i, tile_bytes in enumerate(tiles):
+                st = InputSticker(
+                    sticker=BufferedInputFile(tile_bytes, filename=f"t{i}.png"),
+                    emoji_list=["✨"],
+                    format="static",
+                )
+                await bot.add_sticker_to_set(
+                    user_id=message.from_user.id,
+                    name=pack_name,
+                    sticker=st,
+                )
+                await asyncio.sleep(0.05)
+
+        await state.clear()
+        await wait_msg.edit_text(
+            f"✅ <b>Готово! Добавлено {len(tiles)} эмодзи ({cols}×{rows}).</b>\n\n{pack_card_text(pack_obj)}",
+            reply_markup=pack_card_kb(pack_obj),
+        )
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Ошибка при нарезке/загрузке: <code>{str(e)[:300]}</code>")
+
+
+@dp.message(StickerStates.waiting_add_item)
+async def msg_add_item(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pack_name = data.get("active_pack")
+    pack = find_user_pack(message.from_user.id, pack_name) if pack_name else None
+    if not pack:
+        await state.clear()
+        return
+
+    items, err = await extract_images_from_message(message)
+    if err:
+        await message.answer(err)
+        return
+
+    is_emoji = pack["type"] == "custom_emoji"
+    added = 0
+    try:
+        for idx, (raw_bytes, emoji) in enumerate(items):
+            png_bytes = await asyncio.to_thread(image_to_sticker_png_sync, raw_bytes, is_emoji)
+            st = InputSticker(
+                sticker=BufferedInputFile(png_bytes, filename=f"a{idx}.png"),
+                emoji_list=[emoji],
+                format="static",
+            )
+            await bot.add_sticker_to_set(
+                user_id=message.from_user.id,
+                name=pack_name,
+                sticker=st,
+            )
+            added += 1
+            if len(items) > 1:
+                await asyncio.sleep(0.05)
+
+        await message.answer(
+            f"✅ Добавлено: {added} шт. Отправь ещё или нажми <b>«Готово»</b>.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✅ Готово", callback_data=f"stkp:{pack_name}")]]
+            ),
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось добавить: <code>{str(e)[:250]}</code>")
+
+
+@dp.message(StickerStates.waiting_rename, F.text)
+async def msg_rename_pack(message: types.Message, state: FSMContext):
+    new_raw = (message.text or "").strip()[:45]
+    if not new_raw or new_raw.startswith("/"):
+        await message.answer("❌ Введи обычное название.")
+        return
+
+    data = await state.get_data()
+    pack_name = data.get("active_pack")
+    pack = find_user_pack(message.from_user.id, pack_name) if pack_name else None
+    if not pack:
+        await state.clear()
+        return
+
+    new_full = format_pack_title(new_raw, pack.get("is_premium", False))
+    try:
+        await bot.set_sticker_set_title(name=pack_name, title=new_full)
+        pack["title"] = new_raw
+        await save_state()
+        await state.clear()
+        await message.answer(
+            f"✅ Название обновлено!\n\n{pack_card_text(pack)}",
+            reply_markup=pack_card_kb(pack),
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось изменить название: <code>{str(e)[:250]}</code>")
+
+
+@dp.message(StickerStates.waiting_delete_sticker)
+async def msg_delete_sticker(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pack_name = data.get("active_pack")
+    pack = find_user_pack(message.from_user.id, pack_name) if pack_name else None
+    if not pack:
+        await state.clear()
+        return
+
+    target_file_id = None
+    if message.sticker:
+        if message.sticker.set_name != pack_name:
+            await message.answer("❌ Этот стикер из другого набора. Отправь стикер именно из выбранного пака.")
+            return
+        target_file_id = message.sticker.file_id
+    elif message.entities:
+        emoji_ids = [
+            e.custom_emoji_id
+            for e in message.entities
+            if e.type == "custom_emoji" and e.custom_emoji_id
+        ]
+        if emoji_ids:
+            stickers = await bot.get_custom_emoji_stickers([emoji_ids[0]])
+            if stickers and stickers[0].set_name == pack_name:
+                target_file_id = stickers[0].file_id
+            else:
+                await message.answer("❌ Этот эмодзи не из выбранного набора.")
+                return
+
+    if not target_file_id:
+        await message.answer("❌ Отправь сам стикер или премиум-эмодзи из этого набора.")
+        return
+
+    try:
+        await bot.delete_sticker_from_set(sticker=target_file_id)
+        await state.clear()
+        await message.answer(
+            f"✅ Удалено из набора!\n\n{pack_card_text(pack)}",
+            reply_markup=pack_card_kb(pack),
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось удалить: <code>{str(e)[:250]}</code>")
 
 
 # ==================== МЕНЮ АДМИН-ПАНЕЛИ ====================
@@ -306,6 +1040,7 @@ def admin_menu_text() -> str:
         f"<i>(чаты: {st['today_inline']} | личка: {st['today_dm']})</i>\n"
         f"📈 <b>За всё время:</b> {all_total} "
         f"<i>(чаты: {st['total_inline']} | личка: {st['total_dm']})</i>\n"
+        f"🎨 <b>Создано стикерпаков:</b> {st.get('packs_created', 0)}\n"
         f"👁 <b>Показов рекламы:</b> {st['ad_impressions']}\n\n"
         f"📢 <b>Подпись (реклама):</b> {ad_status}\n"
         f"🔗 <b>Кнопка-источник:</b> {src_status} <i>(текст меняется в «📝 Тексты бота»)</i>"
@@ -546,14 +1281,12 @@ async def download_pinterest_fallback(url: str) -> dict:
 
             cleaned = html_text.replace("\\/", "/").replace("\\u002F", "/")
 
-            # 1. Сначала ищем прямые MP4-видео на странице Pinterest
             mp4_urls = re.findall(
                 r"https://v[0-9]*\.pinimg\.com/videos/[^\s\"'<>\\]+\.mp4",
                 cleaned,
                 re.IGNORECASE,
             )
             if mp4_urls:
-                # Предпочитаем 720p / expMp4
                 mp4_urls.sort(key=lambda u: ("720p" in u or "expMp4" in u), reverse=True)
                 for video_url in mp4_urls:
                     async with session.get(video_url) as vresp:
@@ -573,7 +1306,6 @@ async def download_pinterest_fallback(url: str) -> dict:
                                     "duration": None,
                                 }
 
-            # 2. Если MP4 нет — ищем HLS-поток (.m3u8) и собираем его в MP4 через ffmpeg
             m3u8_urls = re.findall(
                 r"https://v[0-9]*\.pinimg\.com/videos/[^\s\"'<>\\]+\.m3u8",
                 cleaned,
@@ -594,7 +1326,6 @@ async def download_pinterest_fallback(url: str) -> dict:
                             "duration": None,
                         }
 
-            # 3. Если видео на странице действительно нет — скачиваем картинку
             img_url = None
             m = re.search(
                 r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -732,7 +1463,7 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
         await callback.answer("Счётчик показов сброшен")
 
     elif action == "preview":
-        caption, kb, _ = get_media_payload("https://www.pinterest.com/")
+        caption, kb, _ = get_media_payload("https://www.pinterest.com/", user_id=None)
         if not caption and not kb:
             await callback.answer("Сейчас и подпись, и кнопка-источник выключены", show_alert=True)
             return
@@ -953,7 +1684,7 @@ async def send_downloaded_to_dm(message: types.Message, url: str, user_id: int):
         async with DOWNLOAD_SEMAPHORE:
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_media_payload(url)
+        caption, kb, ad_shown = get_media_payload(url, user_id=user_id)
         mtype = media["media_type"]
 
         if mtype == "audio":
@@ -991,10 +1722,11 @@ async def send_downloaded_to_dm(message: types.Message, url: str, user_id: int):
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await register_user(message.from_user.id, is_dm=True)
     text = STATE["texts"]["start_text"].replace("{username}", BOT_USERNAME)
-    await message.answer(text)
+    await message.answer(text, reply_markup=start_kb())
 
 
 @dp.callback_query(F.data.startswith("scdl:"))
@@ -1008,7 +1740,7 @@ async def handle_dm_soundcloud_pick(callback: types.CallbackQuery):
     await send_downloaded_to_dm(callback.message, url, user_id=callback.from_user.id)
 
 
-@dp.message(F.text)
+@dp.message(StateFilter(None), F.text)
 async def handle_direct_message(message: types.Message):
     await register_user(message.from_user.id, is_dm=True)
     text = (message.text or "").strip()
@@ -1020,7 +1752,6 @@ async def handle_direct_message(message: types.Message):
         await send_downloaded_to_dm(message, match.group(0), user_id=message.from_user.id)
         return
 
-    # Если прислали не ссылку — ищем трек в SoundCloud
     if len(text) < 2 or "http://" in text or "https://" in text:
         return
 
@@ -1055,7 +1786,6 @@ async def handle_inline_query(query: types.InlineQuery):
     q = (query.query or "").strip()
     loading_text = STATE["texts"]["loading_text"]
 
-    # 1. Пустой ввод — показываем карточку-подсказку
     if not q:
         click_text = STATE["texts"]["hint_click_text"].replace("{username}", BOT_USERNAME)
         hint_result = InlineQueryResultArticle(
@@ -1074,7 +1804,6 @@ async def handle_inline_query(query: types.InlineQuery):
         ]
     )
 
-    # 2. Введена ссылка на поддерживаемую площадку
     match = MEDIA_RE.search(q)
     if match:
         url = match.group(0)
@@ -1089,7 +1818,6 @@ async def handle_inline_query(query: types.InlineQuery):
         await query.answer([result], cache_time=1, is_personal=True)
         return
 
-    # 3. Введён текст (не ссылка) — поиск треков в SoundCloud
     if len(q) < 2 or "http://" in q or "https://" in q:
         await query.answer([], cache_time=1)
         return
@@ -1140,7 +1868,7 @@ async def handle_chosen_inline(result: types.ChosenInlineResult):
         async with DOWNLOAD_SEMAPHORE:
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_media_payload(url)
+        caption, kb, ad_shown = get_media_payload(url, user_id=result.from_user.id)
         mtype = media["media_type"]
 
         if mtype == "audio":
