@@ -40,9 +40,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATA_DIR = "data"
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
-# Ссылки: TikTok, Pinterest, X (Twitter), SoundCloud
+# Ссылки: TikTok, Pinterest (любые региональные поддомены и pin.it), X (Twitter), SoundCloud
 MEDIA_RE = re.compile(
-    r"https?://(?:www\.|m\.|vm\.|vt\.|mobile\.|on\.)?"
+    r"https?://(?:[a-z0-9-]+\.)*"
     r"(?:tiktok\.com|pinterest\.[a-z.]+|pin\.it|twitter\.com|x\.com|soundcloud\.com)/\S+",
     re.IGNORECASE,
 )
@@ -62,7 +62,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 class AdminStates(StatesGroup):
     waiting_ad_text = State()
-    waiting_ad_button = State()
     waiting_broadcast = State()
     waiting_custom_text = State()
     waiting_custom_icon = State()
@@ -83,6 +82,10 @@ DEFAULT_TEXTS = {
     "title_pinterest": "📌 Поделиться из Pinterest",
     "title_x": "🎬 Поделиться видео из X",
     "title_soundcloud": "🎵 Поделиться треком из SoundCloud",
+    "src_btn_tiktok": "🎬 Посмотреть в TikTok",
+    "src_btn_pinterest": "📌 Посмотреть на Pinterest",
+    "src_btn_x": "🔗 Посмотреть в X",
+    "src_btn_soundcloud": "🎵 Посмотреть на SoundCloud",
 }
 
 DEFAULT_ICONS = {
@@ -103,6 +106,10 @@ TEXT_LABELS = {
     "title_pinterest": "📌 Карточка Pinterest",
     "title_x": "🎬 Карточка X (Twitter)",
     "title_soundcloud": "🎵 Карточка SoundCloud",
+    "src_btn_tiktok": "🔗 Кнопка: TikTok",
+    "src_btn_pinterest": "🔗 Кнопка: Pinterest",
+    "src_btn_x": "🔗 Кнопка: X (Twitter)",
+    "src_btn_soundcloud": "🔗 Кнопка: SoundCloud",
 }
 
 ICON_LABELS = {
@@ -116,8 +123,7 @@ ICON_LABELS = {
 DEFAULT_STATE = {
     "ad_enabled": True,
     "ad_text": "🔥 Скачано через нашего бота",
-    "ad_btn_text": "",
-    "ad_btn_url": "",
+    "source_btn_enabled": True,
     "texts": dict(DEFAULT_TEXTS),
     "icons": dict(DEFAULT_ICONS),
     "stats": {
@@ -239,18 +245,28 @@ def format_duration(seconds) -> str:
         return ""
 
 
-def get_ad_payload() -> tuple[str | None, InlineKeyboardMarkup | None, bool]:
-    if not STATE["ad_enabled"]:
-        return None, None, False
-    caption = STATE["ad_text"] or None
+def detect_platform_key(url: str) -> str:
+    lower = url.lower()
+    if "soundcloud.com" in lower:
+        return "soundcloud"
+    if "pinterest." in lower or "pin.it" in lower:
+        return "pinterest"
+    if "x.com" in lower or "twitter.com" in lower:
+        return "x"
+    return "tiktok"
+
+
+def get_media_payload(source_url: str) -> tuple[str | None, InlineKeyboardMarkup | None, bool]:
+    caption = STATE["ad_text"] if (STATE["ad_enabled"] and STATE["ad_text"]) else None
     kb = None
-    if STATE["ad_btn_text"] and STATE["ad_btn_url"]:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=STATE["ad_btn_text"], url=STATE["ad_btn_url"])]
-            ]
-        )
-    ad_shown = bool(caption or kb)
+    if STATE.get("source_btn_enabled", True) and source_url:
+        pkey = detect_platform_key(source_url)
+        btn_text = STATE["texts"].get(f"src_btn_{pkey}") or DEFAULT_TEXTS[f"src_btn_{pkey}"]
+        if btn_text:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=source_url)]]
+            )
+    ad_shown = bool(caption)
     return caption, kb, ad_shown
 
 
@@ -268,16 +284,8 @@ def is_pinterest_url(url: str) -> bool:
 
 
 def detect_platform_ui(url: str) -> tuple[str, str]:
-    lower = url.lower()
-    texts = STATE["texts"]
-    icons = STATE["icons"]
-    if "soundcloud.com" in lower:
-        return texts["title_soundcloud"], icons["soundcloud"]
-    if "pinterest." in lower or "pin.it" in lower:
-        return texts["title_pinterest"], icons["pinterest"]
-    if "x.com" in lower or "twitter.com" in lower:
-        return texts["title_x"], icons["x"]
-    return texts["title_tiktok"], icons["tiktok"]
+    pkey = detect_platform_key(url)
+    return STATE["texts"][f"title_{pkey}"], STATE["icons"][pkey]
 
 
 # ==================== МЕНЮ АДМИН-ПАНЕЛИ ====================
@@ -287,12 +295,8 @@ def admin_menu_text() -> str:
     st = STATE["stats"]
     today_total = st["today_inline"] + st["today_dm"]
     all_total = st["total_inline"] + st["total_dm"]
-    status = "🟢 ВКЛ" if STATE["ad_enabled"] else "🔴 ВЫКЛ"
-    btn_info = (
-        f"{STATE['ad_btn_text']} ({STATE['ad_btn_url']})"
-        if STATE["ad_btn_text"] and STATE["ad_btn_url"]
-        else "отключена"
-    )
+    ad_status = "🟢 ВКЛ" if STATE["ad_enabled"] else "🔴 ВЫКЛ"
+    src_status = "🟢 ВКЛ" if STATE.get("source_btn_enabled", True) else "🔴 ВЫКЛ"
     return (
         f"⚙️ <b>Админ-панель</b>\n\n"
         f"👥 <b>Всего уникальных пользователей:</b> {len(STATE['all_users'])}\n"
@@ -303,20 +307,21 @@ def admin_menu_text() -> str:
         f"📈 <b>За всё время:</b> {all_total} "
         f"<i>(чаты: {st['total_inline']} | личка: {st['total_dm']})</i>\n"
         f"👁 <b>Показов рекламы:</b> {st['ad_impressions']}\n\n"
-        f"📢 <b>Реклама:</b> {status}\n"
-        f"🔗 <b>Кнопка:</b> {btn_info}"
+        f"📢 <b>Подпись (реклама):</b> {ad_status}\n"
+        f"🔗 <b>Кнопка-источник:</b> {src_status} <i>(текст меняется в «📝 Тексты бота»)</i>"
     )
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
-    toggle_text = "🔴 Выключить рекламу" if STATE["ad_enabled"] else "🟢 Включить рекламу"
+    ad_toggle = "🔴 Выкл. подпись" if STATE["ad_enabled"] else "🟢 Вкл. подпись"
+    src_toggle = "🔴 Выкл. кнопку-источник" if STATE.get("source_btn_enabled", True) else "🟢 Вкл. кнопку-источник"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data="adm:toggle")],
             [
-                InlineKeyboardButton(text="✏️ Текст рекламы", callback_data="adm:text"),
-                InlineKeyboardButton(text="🔗 Кнопка", callback_data="adm:btn"),
+                InlineKeyboardButton(text=ad_toggle, callback_data="adm:toggle"),
+                InlineKeyboardButton(text="✏️ Текст подписи", callback_data="adm:text"),
             ],
+            [InlineKeyboardButton(text=src_toggle, callback_data="adm:toggle_src")],
             [
                 InlineKeyboardButton(text="📝 Тексты бота", callback_data="adm:texts_menu"),
                 InlineKeyboardButton(text="🖼 Иконки", callback_data="adm:icons_menu"),
@@ -478,20 +483,118 @@ def download_ytdlp_sync(url: str, audio_mode: bool) -> dict:
         raise
 
 
-async def download_pinterest_image(url: str) -> dict:
+def normalize_pinterest_url_sync(url: str) -> str:
+    return re.sub(
+        r"^https?://(?:[a-z0-9-]+\.)?pinterest\.[a-z.]+",
+        "https://www.pinterest.com",
+        url,
+        flags=re.IGNORECASE,
+    )
+
+
+async def resolve_pinterest_url(url: str) -> str:
+    if "pin.it" in url.lower():
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    url = str(resp.url)
+        except Exception:
+            pass
+    return normalize_pinterest_url_sync(url)
+
+
+def remux_hls_to_mp4_sync(m3u8_url: str, out_path: str) -> bool:
+    cmd_copy = [
+        "ffmpeg", "-y", "-i", m3u8_url,
+        "-c", "copy", "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart", out_path,
+    ]
+    res = subprocess.run(cmd_copy, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
+        return True
+
+    cmd_reencode = [
+        "ffmpeg", "-y", "-i", m3u8_url,
+        "-c:v", "libx264", "-preset", "fast", "-c:a", "aac",
+        "-movflags", "+faststart", out_path,
+    ]
+    res2 = subprocess.run(cmd_reencode, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return res2.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10000
+
+
+async def download_pinterest_fallback(url: str) -> dict:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
     }
     temp_dir = tempfile.mkdtemp()
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(url, allow_redirects=True) as resp:
                 html_text = await resp.text(errors="ignore")
 
+            cleaned = html_text.replace("\\/", "/").replace("\\u002F", "/")
+
+            # 1. Сначала ищем прямые MP4-видео на странице Pinterest
+            mp4_urls = re.findall(
+                r"https://v[0-9]*\.pinimg\.com/videos/[^\s\"'<>\\]+\.mp4",
+                cleaned,
+                re.IGNORECASE,
+            )
+            if mp4_urls:
+                # Предпочитаем 720p / expMp4
+                mp4_urls.sort(key=lambda u: ("720p" in u or "expMp4" in u), reverse=True)
+                for video_url in mp4_urls:
+                    async with session.get(video_url) as vresp:
+                        if vresp.status == 200:
+                            vbytes = await vresp.read()
+                            if len(vbytes) > 10000:
+                                out_path = os.path.join(temp_dir, "video.mp4")
+                                with open(out_path, "wb") as f:
+                                    f.write(vbytes)
+                                return {
+                                    "path": out_path,
+                                    "thumb_path": None,
+                                    "temp_dir": temp_dir,
+                                    "media_type": "video",
+                                    "title": None,
+                                    "performer": None,
+                                    "duration": None,
+                                }
+
+            # 2. Если MP4 нет — ищем HLS-поток (.m3u8) и собираем его в MP4 через ffmpeg
+            m3u8_urls = re.findall(
+                r"https://v[0-9]*\.pinimg\.com/videos/[^\s\"'<>\\]+\.m3u8",
+                cleaned,
+                re.IGNORECASE,
+            )
+            if m3u8_urls:
+                out_path = os.path.join(temp_dir, "video.mp4")
+                for hls_url in m3u8_urls:
+                    ok = await asyncio.to_thread(remux_hls_to_mp4_sync, hls_url, out_path)
+                    if ok:
+                        return {
+                            "path": out_path,
+                            "thumb_path": None,
+                            "temp_dir": temp_dir,
+                            "media_type": "video",
+                            "title": None,
+                            "performer": None,
+                            "duration": None,
+                        }
+
+            # 3. Если видео на странице действительно нет — скачиваем картинку
             img_url = None
             m = re.search(
                 r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -509,15 +612,14 @@ async def download_pinterest_image(url: str) -> dict:
             else:
                 m2 = re.search(
                     r"https://i\.pinimg\.com/(?:originals|736x|564x)/[a-zA-Z0-9/_-]+\.(?:jpg|jpeg|png|webp)",
-                    html_text,
+                    cleaned,
                 )
                 if m2:
                     img_url = m2.group(0)
 
             if not img_url:
-                raise RuntimeError("Не удалось найти картинку на странице Pinterest")
+                raise RuntimeError("Не удалось найти видео или картинку на странице Pinterest")
 
-            # Пробуем забрать оригинал в максимальном качестве
             orig_url = re.sub(r"i\.pinimg\.com/\d+x/", "i.pinimg.com/originals/", img_url)
             chosen_bytes = None
             for candidate in (orig_url, img_url):
@@ -549,11 +651,12 @@ async def download_pinterest_image(url: str) -> dict:
 
 async def download_media(url: str) -> dict:
     audio_mode = is_soundcloud_url(url)
+    target_url = await resolve_pinterest_url(url) if is_pinterest_url(url) else url
     try:
-        return await asyncio.to_thread(download_ytdlp_sync, url, audio_mode)
+        return await asyncio.to_thread(download_ytdlp_sync, target_url, audio_mode)
     except Exception:
-        if is_pinterest_url(url):
-            return await download_pinterest_image(url)
+        if is_pinterest_url(target_url):
+            return await download_pinterest_fallback(target_url)
         raise
 
 
@@ -610,7 +713,15 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
         await callback.message.edit_text(
             admin_menu_text(), reply_markup=admin_menu_kb(), disable_web_page_preview=True
         )
-        await callback.answer("Статус рекламы изменён")
+        await callback.answer("Статус подписи изменён")
+
+    elif action == "toggle_src":
+        STATE["source_btn_enabled"] = not STATE.get("source_btn_enabled", True)
+        await save_state()
+        await callback.message.edit_text(
+            admin_menu_text(), reply_markup=admin_menu_kb(), disable_web_page_preview=True
+        )
+        await callback.answer("Статус кнопки-источника изменён")
 
     elif action == "reset_imp":
         STATE["stats"]["ad_impressions"] = 0
@@ -621,12 +732,12 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
         await callback.answer("Счётчик показов сброшен")
 
     elif action == "preview":
-        caption, kb, ad_shown = get_ad_payload()
-        if not ad_shown:
-            await callback.answer("Сейчас реклама выключена или пустая", show_alert=True)
+        caption, kb, _ = get_media_payload("https://www.pinterest.com/")
+        if not caption and not kb:
+            await callback.answer("Сейчас и подпись, и кнопка-источник выключены", show_alert=True)
             return
         await callback.message.answer(
-            caption or "<i>(только кнопка, без текста)</i>",
+            caption or "<i>(подпись выключена, показана только кнопка-источник)</i>",
             reply_markup=kb,
             disable_web_page_preview=True,
         )
@@ -635,20 +746,9 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
     elif action == "text":
         await state.set_state(AdminStates.waiting_ad_text)
         await callback.message.edit_text(
-            "✏️ <b>Отправь новый текст рекламы</b>\n\n"
+            "✏️ <b>Отправь новый текст подписи (рекламы) под медиа</b>\n\n"
             "Можно использовать жирность, эмодзи и вшитые ссылки Telegram.\n"
-            "Чтобы убрать текст (оставить только кнопку), отправь <code>0</code>.",
-            reply_markup=cancel_kb(),
-        )
-        await callback.answer()
-
-    elif action == "btn":
-        await state.set_state(AdminStates.waiting_ad_button)
-        await callback.message.edit_text(
-            "🔗 <b>Настройка кнопки под медиа</b>\n\n"
-            "Отправь текст и ссылку через вертикальную черту:\n"
-            "<code>⚡ ВСЕ СКИДКИ ТУТ | https://t.me/твой_канал</code>\n\n"
-            "Чтобы отключить кнопку, отправь <code>0</code>.",
+            "Чтобы полностью убрать подпись, отправь <code>0</code>.",
             reply_markup=cancel_kb(),
         )
         await callback.answer()
@@ -814,44 +914,7 @@ async def process_ad_text(message: types.Message, state: FSMContext):
     await save_state()
     await state.clear()
     await message.answer(
-        "✅ Текст рекламы обновлён!\n\n" + admin_menu_text(),
-        reply_markup=admin_menu_kb(),
-        disable_web_page_preview=True,
-    )
-
-
-@dp.message(AdminStates.waiting_ad_button)
-async def process_ad_button(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    text = (message.text or "").strip()
-    if text == "0":
-        STATE["ad_btn_text"] = ""
-        STATE["ad_btn_url"] = ""
-        await save_state()
-        await state.clear()
-        await message.answer(
-            "✅ Кнопка отключена.\n\n" + admin_menu_text(),
-            reply_markup=admin_menu_kb(),
-            disable_web_page_preview=True,
-        )
-        return
-
-    if "|" not in text:
-        await message.answer("❌ Неверный формат. Напиши через черту: <code>Текст | https://ссылка</code>", reply_markup=cancel_kb())
-        return
-
-    btn_text, btn_url = [part.strip() for part in text.split("|", 1)]
-    if not btn_url.startswith(("http://", "https://", "tg://")):
-        await message.answer("❌ Ссылка должна начинаться с <code>https://</code>", reply_markup=cancel_kb())
-        return
-
-    STATE["ad_btn_text"] = btn_text
-    STATE["ad_btn_url"] = btn_url
-    await save_state()
-    await state.clear()
-    await message.answer(
-        "✅ Кнопка обновлена!\n\n" + admin_menu_text(),
+        "✅ Текст подписи обновлён!\n\n" + admin_menu_text(),
         reply_markup=admin_menu_kb(),
         disable_web_page_preview=True,
     )
@@ -890,7 +953,7 @@ async def send_downloaded_to_dm(message: types.Message, url: str, user_id: int):
         async with DOWNLOAD_SEMAPHORE:
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_ad_payload()
+        caption, kb, ad_shown = get_media_payload(url)
         mtype = media["media_type"]
 
         if mtype == "audio":
@@ -1077,7 +1140,7 @@ async def handle_chosen_inline(result: types.ChosenInlineResult):
         async with DOWNLOAD_SEMAPHORE:
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_ad_payload()
+        caption, kb, ad_shown = get_media_payload(url)
         mtype = media["media_type"]
 
         if mtype == "audio":
