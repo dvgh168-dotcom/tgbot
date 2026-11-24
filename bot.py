@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import uuid
 from collections import OrderedDict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import aiohttp
@@ -31,6 +31,7 @@ from aiogram.types import (
     InputMediaVideo,
     InputSticker,
     InputTextMessageContent,
+    LabeledPrice,
 )
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
@@ -42,6 +43,7 @@ STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "0"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DATA_DIR = "data"
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
 MEDIA_RE = re.compile(
@@ -50,9 +52,11 @@ MEDIA_RE = re.compile(
     re.IGNORECASE,
 )
 
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
-SEARCH_SEMAPHORE = asyncio.Semaphore(5)
-MEDIA_PROC_SEMAPHORE = asyncio.Semaphore(2)
+REGULAR_DOWNLOAD_SEM = asyncio.Semaphore(3)
+PREMIUM_DOWNLOAD_SEM = asyncio.Semaphore(6)
+REGULAR_PROC_SEM = asyncio.Semaphore(2)
+PREMIUM_PROC_SEM = asyncio.Semaphore(4)
+
 STATE_LOCK = asyncio.Lock()
 BOT_USERNAME = ""
 
@@ -68,6 +72,9 @@ class AdminStates(StatesGroup):
     waiting_broadcast = State()
     waiting_custom_text = State()
     waiting_custom_icon = State()
+    waiting_pack_price = State()
+    waiting_sub_price = State()
+    waiting_grant_prem = State()
 
 
 class StickerStates(StatesGroup):
@@ -81,22 +88,6 @@ class StickerStates(StatesGroup):
     waiting_rename = State()
     waiting_delete_sticker = State()
 
-
-OLD_START_TEXTS = {
-    (
-        "👋 Привет! Я скачиваю видео, фото и музыку без водяных знаков.\n\n"
-        "<b>Поддерживаются:</b> TikTok, Pinterest (видео и фото), X (Twitter) и SoundCloud.\n\n"
-        "• Отправь ссылку или название трека прямо сюда\n"
-        "• Или введи <code>@{username} ссылка / название трека</code> в любом чате!"
-    ),
-    (
-        "👋 Привет! Я скачиваю видео, фото и музыку без водяных знаков, "
-        "а ещё помогаю собирать свои стикерпаки и сетки премиум-эмодзи.\n\n"
-        "<b>Загрузка медиа:</b> TikTok, Pinterest (видео и фото), X (Twitter) и SoundCloud.\n\n"
-        "• Отправь ссылку или название трека прямо сюда\n"
-        "• Или введи <code>@{username} ссылка / название трека</code> в любом чате!"
-    ),
-}
 
 DEFAULT_TEXTS = {
     "start_text": (
@@ -161,6 +152,9 @@ DEFAULT_STATE = {
     "ad_enabled": True,
     "ad_text": "🔥 Скачано через нашего бота",
     "source_btn_enabled": True,
+    "admin_premium": True,
+    "pack_price_stars": 75,
+    "sub_price_stars": 175,
     "texts": dict(DEFAULT_TEXTS),
     "icons": dict(DEFAULT_ICONS),
     "stats": {
@@ -172,6 +166,7 @@ DEFAULT_STATE = {
         "today_users": [],
         "ad_impressions": 0,
         "packs_created": 0,
+        "stars_earned": 0,
     },
     "users": [],
     "all_users": [],
@@ -196,8 +191,6 @@ def load_state_sync() -> dict:
         for k, v in DEFAULT_TEXTS.items():
             if k not in data["texts"]:
                 data["texts"][k] = v
-        if data["texts"].get("start_text") in OLD_START_TEXTS:
-            data["texts"]["start_text"] = DEFAULT_TEXTS["start_text"]
         for k, v in DEFAULT_ICONS.items():
             if k not in data["icons"]:
                 data["icons"][k] = v
@@ -232,6 +225,66 @@ async def save_state():
     async with STATE_LOCK:
         _refresh_today()
         await asyncio.to_thread(save_state_sync, STATE)
+
+
+def create_rotated_backup_sync() -> str:
+    """Сохраняет свежий бэкап state.json и оставляет строго 3 последних файла."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_path = os.path.join(BACKUP_DIR, f"state_{stamp}.json")
+    with open(backup_path, "w", encoding="utf-8") as f:
+        json.dump(STATE, f, ensure_ascii=False, indent=2)
+
+    files = sorted(
+        [
+            os.path.join(BACKUP_DIR, fn)
+            for fn in os.listdir(BACKUP_DIR)
+            if fn.startswith("state_") and fn.endswith(".json")
+        ]
+    )
+    while len(files) > 3:
+        oldest = files.pop(0)
+        try:
+            os.remove(oldest)
+        except Exception:
+            pass
+    return backup_path
+
+
+def cleanup_stale_temp_dirs_sync():
+    tmp_root = tempfile.gettempdir()
+    try:
+        for entry in os.listdir(tmp_root):
+            if entry.startswith("tgbot_tmp_"):
+                shutil.rmtree(os.path.join(tmp_root, entry), ignore_errors=True)
+    except Exception:
+        pass
+
+
+async def run_backup_and_send(chat_id: int | None = None, silent: bool = True):
+    async with STATE_LOCK:
+        _refresh_today()
+        path = await asyncio.to_thread(create_rotated_backup_sync)
+    target = chat_id or STORAGE_CHAT_ID or ADMIN_ID
+    if target:
+        try:
+            await bot.send_document(
+                chat_id=target,
+                document=FSInputFile(path),
+                caption="💾 Автоматический бэкап базы бота (хранятся 3 последние копии)",
+                disable_notification=silent,
+            )
+        except Exception:
+            pass
+
+
+async def daily_backup_loop():
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            await run_backup_and_send(silent=True)
+        except Exception:
+            pass
 
 
 async def register_user(user_id: int, is_dm: bool = False):
@@ -272,16 +325,45 @@ def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 
-def has_premium(user_id: int) -> bool:
-    if is_admin(user_id):
-        return True
+def get_premium_expiry(user_id: int) -> datetime | None:
     exp_str = STATE.get("premium_users", {}).get(str(user_id))
     if not exp_str:
-        return False
+        return None
     try:
-        return datetime.fromisoformat(exp_str) > datetime.utcnow()
+        dt = datetime.fromisoformat(exp_str)
+        return dt if dt > datetime.utcnow() else None
     except Exception:
-        return False
+        return None
+
+
+def has_premium(user_id: int) -> bool:
+    if is_admin(user_id):
+        return bool(STATE.get("admin_premium", True))
+    return get_premium_expiry(user_id) is not None
+
+
+def get_dl_sem(user_id: int | None) -> asyncio.Semaphore:
+    if user_id and has_premium(user_id):
+        return PREMIUM_DOWNLOAD_SEM
+    return REGULAR_DOWNLOAD_SEM
+
+
+def get_proc_sem(user_id: int | None) -> asyncio.Semaphore:
+    if user_id and has_premium(user_id):
+        return PREMIUM_PROC_SEM
+    return REGULAR_PROC_SEM
+
+
+def count_active_premium_users() -> int:
+    now = datetime.utcnow()
+    count = 0
+    for exp_str in STATE.get("premium_users", {}).values():
+        try:
+            if datetime.fromisoformat(exp_str) > now:
+                count += 1
+        except Exception:
+            pass
+    return count
 
 
 def cache_search_url(url: str) -> str:
@@ -319,12 +401,15 @@ def get_media_payload(source_url: str, user_id: int | None = None) -> tuple[str 
     caption = None if is_prem else (STATE["ad_text"] if (STATE["ad_enabled"] and STATE["ad_text"]) else None)
     kb = None
     if STATE.get("source_btn_enabled", True) and source_url:
-        pkey = detect_platform_key(source_url)
-        btn_text = STATE["texts"].get(f"src_btn_{pkey}") or DEFAULT_TEXTS[f"src_btn_{pkey}"]
-        if btn_text:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=source_url)]]
-            )
+        lower_url = source_url.lower()
+        # Не показываем кнопку, если SoundCloud вернул внутреннюю API-ссылку с 401
+        if "api.soundcloud.com" not in lower_url and "api-v2.soundcloud.com" not in lower_url:
+            pkey = detect_platform_key(source_url)
+            btn_text = STATE["texts"].get(f"src_btn_{pkey}") or DEFAULT_TEXTS[f"src_btn_{pkey}"]
+            if btn_text:
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text=btn_text, url=source_url)]]
+                )
     ad_shown = bool(caption)
     return caption, kb, ad_shown
 
@@ -348,6 +433,7 @@ def start_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать фото / видео", callback_data="nav:download")],
             [InlineKeyboardButton(text="🎨 Стикеры и Эмодзи", callback_data="stk:menu")],
+            [InlineKeyboardButton(text="💎 Премиум", callback_data="prem:menu:home")],
         ]
     )
 
@@ -356,6 +442,187 @@ def stk_cancel_kb(back_cb: str = "stk:menu") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_cb)]]
     )
+
+
+# ==================== ЭКРАНЫ ПРЕМИУМА И ОПЛАТЫ (TELEGRAM STARS) ====================
+
+def general_premium_text(user_id: int) -> str:
+    if is_admin(user_id) and STATE.get("admin_premium", True):
+        status_line = "🟢 <b>Статус:</b> активен <i>(режим админа)</i>"
+    else:
+        exp = get_premium_expiry(user_id)
+        if exp:
+            status_line = f"🟢 <b>Статус:</b> активен до {exp.strftime('%d.%m.%Y %H:%M')} UTC"
+        else:
+            status_line = "🔴 <b>Статус:</b> не подключён"
+
+    return (
+        f"💎 <b>Премиум на 30 дней</b>\n\n"
+        f"{status_line}\n\n"
+        f"• <b>Отсутствие рекламы</b> при скачивании видео, фото и музыки\n"
+        f"• <b>Упоминания бота отсутствуют</b> во всех новых наборах стикеров и эмодзи\n"
+        f"• <b>Ускоренная загрузка</b> — приоритетная обработка без общей очереди"
+    )
+
+
+def general_premium_kb(user_id: int, back_cb: str = "stk:home") -> InlineKeyboardMarkup:
+    sub_price = STATE.get("sub_price_stars", 175)
+    has_active = get_premium_expiry(user_id) is not None
+    btn_label = (
+        f"💎 Продлить на 30 дней — {sub_price} ⭐"
+        if has_active
+        else f"💎 Подключить на 30 дней — {sub_price} ⭐"
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=btn_label, callback_data="prem:buy_sub")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
+        ]
+    )
+
+
+def pack_upgrade_text(pack: dict) -> str:
+    pack_price = STATE.get("pack_price_stars", 75)
+    sub_price = STATE.get("sub_price_stars", 175)
+    return (
+        f"💎 <b>Улучшение набора «{pack['title']}»</b>\n\n"
+        f"• <b>Упоминания бота отсутствуют</b> в названии набора\n"
+        f"• <b>Разовая оплата навсегда</b> — без продлений\n"
+        f"• <b>Сохраняется при правках</b> — даже если переименуешь набор или добавишь стикеры\n\n"
+        f"💡 <i>Разовое улучшение — {pack_price} ⭐, либо общий Премиум на 30 дней за {sub_price} ⭐ (убирает рекламу и приписку бота во всех новых наборах).</i>"
+    )
+
+
+def pack_upgrade_kb(pack_name: str) -> InlineKeyboardMarkup:
+    pack_price = STATE.get("pack_price_stars", 75)
+    sub_price = STATE.get("sub_price_stars", 175)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"🆙 Улучшить набор — {pack_price} ⭐", callback_data=f"prem:buy_pack:{pack_name}")],
+            [InlineKeyboardButton(text=f"💎 Общий Премиум (30 дней) — {sub_price} ⭐", callback_data="prem:buy_sub")],
+            [InlineKeyboardButton(text="⬅️ Назад к набору", callback_data=f"stkp:{pack_name}")],
+        ]
+    )
+
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: types.Message, state: FSMContext):
+    await state.clear()
+    await register_user(message.from_user.id, is_dm=True)
+    await message.answer(
+        general_premium_text(message.from_user.id),
+        reply_markup=general_premium_kb(message.from_user.id, "stk:home"),
+    )
+
+
+@dp.callback_query(F.data.startswith("prem:menu:"))
+async def cb_prem_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    origin = callback.data.split(":", 2)[2]
+    back_cb = "nav:download" if origin == "download" else "stk:home"
+    await callback.message.edit_text(
+        general_premium_text(callback.from_user.id),
+        reply_markup=general_premium_kb(callback.from_user.id, back_cb),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "prem:buy_sub")
+async def cb_prem_buy_sub(callback: types.CallbackQuery):
+    price = int(STATE.get("sub_price_stars", 175))
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="Премиум на 30 дней",
+        description="Отсутствие рекламы, наборы без упоминания бота и ускоренная загрузка на 30 дней.",
+        payload="sub:30d",
+        currency="XTR",
+        prices=[LabeledPrice(label="Премиум на 30 дней", amount=price)],
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("prem:buy_pack:"))
+async def cb_prem_buy_pack(callback: types.CallbackQuery):
+    pack_name = callback.data.split(":", 2)[2]
+    pack = find_user_pack(callback.from_user.id, pack_name)
+    if not pack:
+        await callback.answer("Набор не найден", show_alert=True)
+        return
+    if pack.get("is_premium"):
+        await callback.answer("Этот набор уже улучшен!", show_alert=True)
+        return
+
+    price = int(STATE.get("pack_price_stars", 75))
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Улучшение набора «{pack['title'][:20]}»",
+        description="Убирает упоминание бота из названия набора навсегда.",
+        payload=f"pack:{pack_name}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Улучшение набора навсегда", amount=price)],
+    )
+    await callback.answer()
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout: types.PreCheckoutQuery):
+    payload = pre_checkout.invoice_payload
+    if payload == "sub:30d":
+        await pre_checkout.answer(ok=True)
+        return
+    if payload.startswith("pack:"):
+        pack_name = payload.split(":", 1)[1]
+        pack = find_user_pack(pre_checkout.from_user.id, pack_name)
+        if pack:
+            await pre_checkout.answer(ok=True)
+        else:
+            await pre_checkout.answer(ok=False, error_message="Набор не найден или уже удалён.")
+        return
+    await pre_checkout.answer(ok=False, error_message="Неизвестный платёж.")
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message, state: FSMContext):
+    await state.clear()
+    payment = message.successful_payment
+    payload = payment.invoice_payload
+    user_id = message.from_user.id
+
+    STATE["stats"]["stars_earned"] = STATE["stats"].get("stars_earned", 0) + payment.total_amount
+
+    if payload == "sub:30d":
+        now = datetime.utcnow()
+        current_exp = get_premium_expiry(user_id)
+        base_dt = current_exp if (current_exp and current_exp > now) else now
+        new_exp = base_dt + timedelta(days=30)
+        STATE.setdefault("premium_users", {})[str(user_id)] = new_exp.isoformat()
+        await save_state()
+        await message.answer(
+            f"🎉 <b>Премиум подключён!</b>\n\n"
+            f"Доступ активен до <b>{new_exp.strftime('%d.%m.%Y %H:%M')} UTC</b>.\n"
+            f"Реклама отключена, упоминания бота в новых наборах убраны, ускоренная загрузка активна.",
+            reply_markup=start_kb(),
+        )
+        return
+
+    if payload.startswith("pack:"):
+        pack_name = payload.split(":", 1)[1]
+        pack = find_user_pack(user_id, pack_name)
+        if pack:
+            pack["is_premium"] = True
+            try:
+                await bot.set_sticker_set_title(name=pack_name, title=pack["title"][:64])
+            except Exception:
+                pass
+            await save_state()
+            await message.answer(
+                f"🎉 <b>Набор улучшен до премиума!</b>\n\n{pack_card_text(pack)}",
+                reply_markup=pack_card_kb(pack),
+            )
+            return
+
+    await save_state()
+    await message.answer("✅ Оплата получена!", reply_markup=start_kb())
 
 
 # ==================== ОБРАБОТКА МЕДИА ДЛЯ СТИКЕРОВ И ЭМОДЗИ ====================
@@ -401,7 +668,7 @@ def image_to_sticker_png_sync(raw_bytes: bytes, is_emoji: bool) -> bytes:
 
 
 def video_to_sticker_webm_sync(raw_bytes: bytes, is_emoji: bool, ext: str = ".mp4") -> bytes:
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp(prefix="tgbot_tmp_")
     try:
         in_path = os.path.join(temp_dir, f"in{ext}")
         out_path = os.path.join(temp_dir, "out.webm")
@@ -439,34 +706,43 @@ def video_to_sticker_webm_sync(raw_bytes: bytes, is_emoji: bool, ext: str = ".mp
 
 def slice_image_auto_grid_sync(raw_bytes: bytes) -> tuple[list[bytes], int, int]:
     """
-    Режет картинку строго на 8 плиток в ширину (как в панели эмодзи Telegram),
-    высоту (2..6 рядов) подбирает автоматически по пропорциям, заполняя края без пустых дыр.
+    Режет картинку строго на 8 колонок в ширину без растягивания и без обрезки.
+    Высоту (1..15 рядов) подбирает по пропорциям, а пустые колонки по бокам
+    для узких фото заполняет прозрачными плитками-заглушками.
     """
     img = Image.open(BytesIO(raw_bytes)).convert("RGBA")
     cols = 8
-    ratio = img.height / max(img.width, 1)
-    rows = max(2, min(6, round(cols * ratio)))
-
     tile_size = 100
-    target_w = cols * tile_size
+    target_w = cols * tile_size  # 800 px
+
+    scaled_h = target_w * (img.height / max(img.width, 1))
+    rows = max(1, min(15, round(scaled_h / tile_size)))
     target_h = rows * tile_size
 
-    fitted = ImageOps.fit(img, (target_w, target_h), Image.Resampling.LANCZOS)
+    fitted = ImageOps.contain(img, (target_w, target_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    offset = ((target_w - fitted.width) // 2, (target_h - fitted.height) // 2)
+    canvas.paste(fitted, offset, fitted)
 
     tiles = []
     for r in range(rows):
         for c in range(cols):
             box = (c * tile_size, r * tile_size, (c + 1) * tile_size, (r + 1) * tile_size)
-            tile = fitted.crop(box)
+            tile = canvas.crop(box)
+            if tile.getbbox() is None:
+                tile.putpixel((0, 0), (0, 0, 0, 1))
             buf = BytesIO()
             tile.save(buf, format="PNG")
             tiles.append(buf.getvalue())
     return tiles, cols, rows
 
 
-async def build_input_sticker_from_tg_sticker(st: types.Sticker, target_type: str, idx: int = 0) -> InputSticker:
+async def build_input_sticker_from_tg_sticker(
+    st: types.Sticker, target_type: str, idx: int = 0, user_id: int | None = None
+) -> InputSticker:
     is_emoji = target_type == "custom_emoji"
     emoji = st.emoji or "😀"
+    sem = get_proc_sem(user_id)
 
     if st.is_animated:
         io_obj = await bot.download(st)
@@ -480,7 +756,7 @@ async def build_input_sticker_from_tg_sticker(st: types.Sticker, target_type: st
         if st.type == target_type:
             return InputSticker(sticker=st.file_id, emoji_list=[emoji], format="video")
         io_obj = await bot.download(st)
-        async with MEDIA_PROC_SEMAPHORE:
+        async with sem:
             webm = await asyncio.to_thread(video_to_sticker_webm_sync, io_obj.read(), is_emoji, ".webm")
         return InputSticker(
             sticker=BufferedInputFile(webm, filename=f"v{idx}.webm"),
@@ -489,7 +765,7 @@ async def build_input_sticker_from_tg_sticker(st: types.Sticker, target_type: st
         )
 
     io_obj = await bot.download(st)
-    async with MEDIA_PROC_SEMAPHORE:
+    async with sem:
         png = await asyncio.to_thread(image_to_sticker_png_sync, io_obj.read(), is_emoji)
     return InputSticker(
         sticker=BufferedInputFile(png, filename=f"s{idx}.png"),
@@ -499,16 +775,14 @@ async def build_input_sticker_from_tg_sticker(st: types.Sticker, target_type: st
 
 
 async def extract_input_stickers(message: types.Message, target_type: str) -> tuple[list[InputSticker], str | None]:
-    """
-    Принимает фото, картинки-документы, GIF, короткие видео, стикеры (включая анимированные и видео)
-    и премиум-эмодзи. Возвращает готовый список InputSticker под нужный тип набора.
-    """
     is_emoji = target_type == "custom_emoji"
+    user_id = message.from_user.id if message.from_user else None
+    sem = get_proc_sem(user_id)
     results: list[InputSticker] = []
 
     if message.photo:
         io_obj = await bot.download(message.photo[-1])
-        async with MEDIA_PROC_SEMAPHORE:
+        async with sem:
             png = await asyncio.to_thread(image_to_sticker_png_sync, io_obj.read(), is_emoji)
         results.append(
             InputSticker(sticker=BufferedInputFile(png, filename="p.png"), emoji_list=["😀"], format="static")
@@ -516,12 +790,12 @@ async def extract_input_stickers(message: types.Message, target_type: str) -> tu
         return results, None
 
     if message.sticker:
-        results.append(await build_input_sticker_from_tg_sticker(message.sticker, target_type))
+        results.append(await build_input_sticker_from_tg_sticker(message.sticker, target_type, 0, user_id))
         return results, None
 
     if message.animation:
         io_obj = await bot.download(message.animation)
-        async with MEDIA_PROC_SEMAPHORE:
+        async with sem:
             webm = await asyncio.to_thread(video_to_sticker_webm_sync, io_obj.read(), is_emoji, ".mp4")
         results.append(
             InputSticker(sticker=BufferedInputFile(webm, filename="g.webm"), emoji_list=["😀"], format="video")
@@ -532,7 +806,7 @@ async def extract_input_stickers(message: types.Message, target_type: str) -> tu
         if message.video.file_size and message.video.file_size > 15 * 1024 * 1024:
             return [], "❌ Видео слишком тяжёлое (максимум 15 МБ)."
         io_obj = await bot.download(message.video)
-        async with MEDIA_PROC_SEMAPHORE:
+        async with sem:
             webm = await asyncio.to_thread(video_to_sticker_webm_sync, io_obj.read(), is_emoji, ".mp4")
         results.append(
             InputSticker(sticker=BufferedInputFile(webm, filename="v.webm"), emoji_list=["😀"], format="video")
@@ -543,7 +817,7 @@ async def extract_input_stickers(message: types.Message, target_type: str) -> tu
         mime = (message.document.mime_type or "").lower()
         if mime.startswith("image/"):
             io_obj = await bot.download(message.document)
-            async with MEDIA_PROC_SEMAPHORE:
+            async with sem:
                 png = await asyncio.to_thread(image_to_sticker_png_sync, io_obj.read(), is_emoji)
             results.append(
                 InputSticker(sticker=BufferedInputFile(png, filename="d.png"), emoji_list=["😀"], format="static")
@@ -551,7 +825,7 @@ async def extract_input_stickers(message: types.Message, target_type: str) -> tu
             return results, None
         if mime.startswith("video/"):
             io_obj = await bot.download(message.document)
-            async with MEDIA_PROC_SEMAPHORE:
+            async with sem:
                 webm = await asyncio.to_thread(video_to_sticker_webm_sync, io_obj.read(), is_emoji, ".mp4")
             results.append(
                 InputSticker(sticker=BufferedInputFile(webm, filename="dv.webm"), emoji_list=["😀"], format="video")
@@ -568,7 +842,7 @@ async def extract_input_stickers(message: types.Message, target_type: str) -> tu
         if emoji_ids:
             stickers = await bot.get_custom_emoji_stickers(emoji_ids[:20])
             for idx, st in enumerate(stickers):
-                results.append(await build_input_sticker_from_tg_sticker(st, target_type, idx))
+                results.append(await build_input_sticker_from_tg_sticker(st, target_type, idx, user_id))
             if results:
                 return results, None
 
@@ -659,7 +933,7 @@ def pack_card_kb(pack: dict) -> InlineKeyboardMarkup:
     name = pack["name"]
     rows = []
     if not pack.get("is_premium"):
-        rows.append([InlineKeyboardButton(text="🆙 Улучшить набор (скоро за ⭐)", callback_data=f"stka:prem:{name}")])
+        rows.append([InlineKeyboardButton(text="🆙 Улучшить набор до премиума", callback_data=f"stka:prem:{name}")])
     rows.append([InlineKeyboardButton(text="👀 Посмотреть набор", url=f"https://t.me/addstickers/{name}")])
     rows.append([InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"stka:rename:{name}")])
     rows.append(
@@ -702,10 +976,11 @@ async def cmd_admin(message: types.Message, state: FSMContext):
 async def cb_nav_download(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     text = STATE["texts"]["download_hint"].replace("{username}", BOT_USERNAME)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="stk:home")]]
-    )
-    await callback.message.edit_text(text, reply_markup=kb)
+    rows = []
+    if not has_premium(callback.from_user.id):
+        rows.append([InlineKeyboardButton(text="💎 Отключить рекламу (Премиум)", callback_data="prem:menu:download")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="stk:home")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -807,7 +1082,7 @@ async def msg_first_item(message: types.Message, state: FSMContext):
         )
 
 
-# --- СЕТКА ЭМОДЗИ (СТРОГО 8 В ШИРИНУ, ЦЕЛЬНАЯ КАРТИНКА) ---
+# --- СЕТКА ЭМОДЗИ (СТРОГО 8 В ШИРИНУ, БЕЗ ОБРЕЗКИ, С ЗАГЛУШКАМИ ДЛЯ УЗКИХ ФОТО) ---
 
 @dp.callback_query(F.data == "stk:new_grid")
 async def cb_new_grid(callback: types.CallbackQuery, state: FSMContext):
@@ -855,7 +1130,7 @@ async def msg_grid_photo(message: types.Message, state: FSMContext):
     wait_msg = await message.answer("⏳ Нарезаю картинку и собираю сетку эмодзи...")
 
     try:
-        async with MEDIA_PROC_SEMAPHORE:
+        async with get_proc_sem(message.from_user.id):
             tiles, cols, rows = await asyncio.to_thread(slice_image_auto_grid_sync, raw_bytes)
 
         is_prem = has_premium(message.from_user.id)
@@ -875,9 +1150,17 @@ async def msg_grid_photo(message: types.Message, state: FSMContext):
             user_id=message.from_user.id,
             name=short_name,
             title=full_title,
-            stickers=input_stickers,
+            stickers=input_stickers[:50],
             sticker_type="custom_emoji",
         )
+
+        for extra_st in input_stickers[50:]:
+            await bot.add_sticker_to_set(
+                user_id=message.from_user.id,
+                name=short_name,
+                sticker=extra_st,
+            )
+            await asyncio.sleep(0.05)
 
         pack_obj = {
             "name": short_name,
@@ -905,7 +1188,7 @@ async def msg_grid_photo(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("stk:copy:"))
 async def cb_stk_copy(callback: types.CallbackQuery, state: FSMContext):
-    mode = callback.data.split(":", 2)[2]  # same | to_emoji | to_sticker
+    mode = callback.data.split(":", 2)[2]
     await state.set_state(StickerStates.waiting_copy_source)
     await state.update_data(copy_mode=mode)
 
@@ -971,7 +1254,6 @@ async def msg_copy_title(message: types.Message, state: FSMContext):
             target_type = src_set.sticker_type if src_set.sticker_type in ("regular", "custom_emoji") else "regular"
 
         same_type = src_set.sticker_type == target_type
-        # Чтобы не перегрузить сервер при конвертации огромных видео-паков, ограничиваем до 50 видео при перекодировке
         has_video_reencode = (not same_type) and any(s.is_video for s in src_set.stickers)
         limit = 30 if has_video_reencode else 100
         src_items = src_set.stickers[:limit]
@@ -983,7 +1265,9 @@ async def msg_copy_title(message: types.Message, state: FSMContext):
                 prepared.append(InputSticker(sticker=st.file_id, emoji_list=[st.emoji or "😀"], format=fmt))
             else:
                 try:
-                    prepared.append(await build_input_sticker_from_tg_sticker(st, target_type, idx))
+                    prepared.append(
+                        await build_input_sticker_from_tg_sticker(st, target_type, idx, message.from_user.id)
+                    )
                 except Exception:
                     continue
 
@@ -1074,10 +1358,11 @@ async def cb_pack_action(callback: types.CallbackQuery, state: FSMContext):
     )
 
     if action == "prem":
-        await callback.answer(
-            "Оплата улучшения набора через Telegram Stars появится в следующем обновлении!",
-            show_alert=True,
+        await callback.message.edit_text(
+            pack_upgrade_text(pack),
+            reply_markup=pack_upgrade_kb(pack_name),
         )
+        await callback.answer()
         return
 
     elif action == "rename":
@@ -1277,6 +1562,9 @@ def admin_menu_text() -> str:
     all_total = st["total_inline"] + st["total_dm"]
     ad_status = "🟢 ВКЛ" if STATE["ad_enabled"] else "🔴 ВЫКЛ"
     src_status = "🟢 ВКЛ" if STATE.get("source_btn_enabled", True) else "🔴 ВЫКЛ"
+    my_prem = "🟢 ВКЛ" if STATE.get("admin_premium", True) else "🔴 ВЫКЛ (тест обычного юзера)"
+    pack_price = STATE.get("pack_price_stars", 75)
+    sub_price = STATE.get("sub_price_stars", 175)
     return (
         f"⚙️ <b>Админ-панель</b>\n\n"
         f"👥 <b>Всего уникальных пользователей:</b> {len(STATE['all_users'])}\n"
@@ -1286,16 +1574,22 @@ def admin_menu_text() -> str:
         f"<i>(чаты: {st['today_inline']} | личка: {st['today_dm']})</i>\n"
         f"📈 <b>За всё время:</b> {all_total} "
         f"<i>(чаты: {st['total_inline']} | личка: {st['total_dm']})</i>\n"
-        f"🎨 <b>Создано стикерпаков:</b> {st.get('packs_created', 0)}\n"
+        f"🎨 <b>Создано наборов:</b> {st.get('packs_created', 0)}\n"
         f"👁 <b>Показов рекламы:</b> {st['ad_impressions']}\n\n"
+        f"💎 <b>Активных подписчиков:</b> {count_active_premium_users()} | <b>Заработано:</b> {st.get('stars_earned', 0)} ⭐\n"
+        f"🧪 <b>Мой Премиум:</b> {my_prem}\n"
+        f"💰 <b>Цены:</b> набор — {pack_price} ⭐ | подписка — {sub_price} ⭐\n\n"
         f"📢 <b>Подпись (реклама):</b> {ad_status}\n"
-        f"🔗 <b>Кнопка-источник:</b> {src_status} <i>(текст меняется в «📝 Тексты бота»)</i>"
+        f"🔗 <b>Кнопка-источник:</b> {src_status}"
     )
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
     ad_toggle = "🔴 Выкл. подпись" if STATE["ad_enabled"] else "🟢 Вкл. подпись"
     src_toggle = "🔴 Выкл. кнопку-источник" if STATE.get("source_btn_enabled", True) else "🟢 Вкл. кнопку-источник"
+    my_prem_btn = "🔴 Выкл. мой Премиум" if STATE.get("admin_premium", True) else "🟢 Вкл. мой Премиум"
+    pack_price = STATE.get("pack_price_stars", 75)
+    sub_price = STATE.get("sub_price_stars", 175)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1304,6 +1598,14 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text=src_toggle, callback_data="adm:toggle_src")],
             [
+                InlineKeyboardButton(text=my_prem_btn, callback_data="adm:toggle_my_prem"),
+                InlineKeyboardButton(text="🎁 Выдать / снять Прем", callback_data="adm:grant_prem"),
+            ],
+            [
+                InlineKeyboardButton(text=f"⭐ Цена пака ({pack_price})", callback_data="adm:pack_price"),
+                InlineKeyboardButton(text=f"⭐ Подписка ({sub_price})", callback_data="adm:sub_price"),
+            ],
+            [
                 InlineKeyboardButton(text="📝 Тексты бота", callback_data="adm:texts_menu"),
                 InlineKeyboardButton(text="🖼 Иконки", callback_data="adm:icons_menu"),
             ],
@@ -1311,7 +1613,10 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="👁 Предпросмотр", callback_data="adm:preview"),
                 InlineKeyboardButton(text="🔄 Сбросить показы", callback_data="adm:reset_imp"),
             ],
-            [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="adm:broadcast")],
+            [
+                InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
+                InlineKeyboardButton(text="💾 Бэкап сейчас", callback_data="adm:backup_now"),
+            ],
             [InlineKeyboardButton(text="🔁 Обновить статистику", callback_data="adm:refresh")],
         ]
     )
@@ -1392,7 +1697,7 @@ def search_soundcloud_sync(query_text: str, limit: int = 5) -> list[dict]:
 
 
 def download_ytdlp_sync(url: str, audio_mode: bool) -> dict:
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp(prefix="tgbot_tmp_")
     out_template = os.path.join(temp_dir, "media.%(ext)s")
 
     if audio_mode:
@@ -1458,6 +1763,7 @@ def download_ytdlp_sync(url: str, audio_mode: bool) -> dict:
             "title": info.get("track") or info.get("title"),
             "performer": info.get("artist") or info.get("uploader"),
             "duration": int(duration) if duration else None,
+            "webpage_url": info.get("webpage_url"),
         }
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1518,7 +1824,7 @@ async def download_pinterest_fallback(url: str) -> dict:
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp(prefix="tgbot_tmp_")
     try:
         timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
@@ -1550,6 +1856,7 @@ async def download_pinterest_fallback(url: str) -> dict:
                                     "title": None,
                                     "performer": None,
                                     "duration": None,
+                                    "webpage_url": url,
                                 }
 
             m3u8_urls = re.findall(
@@ -1570,6 +1877,7 @@ async def download_pinterest_fallback(url: str) -> dict:
                             "title": None,
                             "performer": None,
                             "duration": None,
+                            "webpage_url": url,
                         }
 
             img_url = None
@@ -1620,6 +1928,7 @@ async def download_pinterest_fallback(url: str) -> dict:
                 "title": None,
                 "performer": None,
                 "duration": None,
+                "webpage_url": url,
             }
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1692,6 +2001,49 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
         )
         await callback.answer("Статус кнопки-источника изменён")
 
+    elif action == "toggle_my_prem":
+        STATE["admin_premium"] = not STATE.get("admin_premium", True)
+        await save_state()
+        await callback.message.edit_text(
+            admin_menu_text(), reply_markup=admin_menu_kb(), disable_web_page_preview=True
+        )
+        status = "включён" if STATE["admin_premium"] else "выключен (тест обычного юзера)"
+        await callback.answer(f"Твой Премиум {status}")
+
+    elif action == "pack_price":
+        await state.set_state(AdminStates.waiting_pack_price)
+        await callback.message.edit_text(
+            f"⭐ <b>Цена разового улучшения набора</b>\n\n"
+            f"Сейчас: <b>{STATE.get('pack_price_stars', 75)} ⭐</b>\n"
+            f"Отправь новое число звёзд (например: <code>75</code>):",
+            reply_markup=cancel_kb(),
+        )
+        await callback.answer()
+
+    elif action == "sub_price":
+        await state.set_state(AdminStates.waiting_sub_price)
+        await callback.message.edit_text(
+            f"⭐ <b>Цена подписки Премиум на 30 дней</b>\n\n"
+            f"Сейчас: <b>{STATE.get('sub_price_stars', 175)} ⭐</b>\n"
+            f"Отправь новое число звёзд (например: <code>175</code>):",
+            reply_markup=cancel_kb(),
+        )
+        await callback.answer()
+
+    elif action == "grant_prem":
+        await state.set_state(AdminStates.waiting_grant_prem)
+        await callback.message.edit_text(
+            "🎁 <b>Выдать или снять Премиум пользователю</b>\n\n"
+            "• Отправь <code>ID</code> (например: <code>123456789</code>) — выдаст Премиум на 30 дней\n"
+            "• Отправь <code>ID 0</code> (например: <code>123456789 0</code>) — снимет Премиум",
+            reply_markup=cancel_kb(),
+        )
+        await callback.answer()
+
+    elif action == "backup_now":
+        await callback.answer("Создаю бэкап...")
+        await run_backup_and_send(chat_id=callback.from_user.id, silent=False)
+
     elif action == "reset_imp":
         STATE["stats"]["ad_impressions"] = 0
         await save_state()
@@ -1747,6 +2099,74 @@ async def handle_admin_callbacks(callback: types.CallbackQuery, state: FSMContex
             reply_markup=cancel_kb(),
         )
         await callback.answer()
+
+
+@dp.message(AdminStates.waiting_pack_price, F.text)
+async def process_pack_price(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= 10000):
+        await message.answer("❌ Введи целое число от 1 до 10000.", reply_markup=cancel_kb())
+        return
+    STATE["pack_price_stars"] = int(txt)
+    await save_state()
+    await state.clear()
+    await message.answer(
+        f"✅ Новая цена улучшения набора: <b>{txt} ⭐</b>\n\n" + admin_menu_text(),
+        reply_markup=admin_menu_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+@dp.message(AdminStates.waiting_sub_price, F.text)
+async def process_sub_price(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= 10000):
+        await message.answer("❌ Введи целое число от 1 до 10000.", reply_markup=cancel_kb())
+        return
+    STATE["sub_price_stars"] = int(txt)
+    await save_state()
+    await state.clear()
+    await message.answer(
+        f"✅ Новая цена подписки на 30 дней: <b>{txt} ⭐</b>\n\n" + admin_menu_text(),
+        reply_markup=admin_menu_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+@dp.message(AdminStates.waiting_grant_prem, F.text)
+async def process_grant_prem(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").strip().split()
+    if not parts or not parts[0].isdigit():
+        await message.answer("❌ Отправь числовой ID пользователя (или <code>ID 0</code> для снятия).", reply_markup=cancel_kb())
+        return
+
+    target_id = parts[0]
+    revoke = len(parts) > 1 and parts[1] == "0"
+
+    if revoke:
+        STATE.setdefault("premium_users", {}).pop(target_id, None)
+        note = f"🔴 Премиум снят у пользователя <code>{target_id}</code>."
+    else:
+        now = datetime.utcnow()
+        current_exp = get_premium_expiry(int(target_id))
+        base_dt = current_exp if (current_exp and current_exp > now) else now
+        new_exp = base_dt + timedelta(days=30)
+        STATE.setdefault("premium_users", {})[target_id] = new_exp.isoformat()
+        note = f"🟢 Пользователю <code>{target_id}</code> выдан Премиум до <b>{new_exp.strftime('%d.%m.%Y %H:%M')} UTC</b>."
+
+    await save_state()
+    await state.clear()
+    await message.answer(
+        note + "\n\n" + admin_menu_text(),
+        reply_markup=admin_menu_kb(),
+        disable_web_page_preview=True,
+    )
 
 
 @dp.callback_query(F.data.startswith("adm_txt:"))
@@ -1919,10 +2339,11 @@ async def send_downloaded_to_dm(message: types.Message, url: str, user_id: int):
     status_msg = await message.answer(STATE["texts"]["loading_text"])
     media = None
     try:
-        async with DOWNLOAD_SEMAPHORE:
+        async with get_dl_sem(user_id):
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_media_payload(url, user_id=user_id)
+        final_source_url = media.get("webpage_url") or url
+        caption, kb, ad_shown = get_media_payload(final_source_url, user_id=user_id)
         mtype = media["media_type"]
 
         if mtype == "audio":
@@ -2095,10 +2516,11 @@ async def handle_chosen_inline(result: types.ChosenInlineResult):
 
     media = None
     try:
-        async with DOWNLOAD_SEMAPHORE:
+        async with get_dl_sem(result.from_user.id):
             media = await download_media(url)
 
-        caption, kb, ad_shown = get_media_payload(url, user_id=result.from_user.id)
+        final_source_url = media.get("webpage_url") or url
+        caption, kb, ad_shown = get_media_payload(final_source_url, user_id=result.from_user.id)
         mtype = media["media_type"]
 
         if mtype == "audio":
@@ -2159,8 +2581,10 @@ async def handle_loading_click(callback: types.CallbackQuery):
 
 async def main():
     global BOT_USERNAME
+    await asyncio.to_thread(cleanup_stale_temp_dirs_sync)
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
+    asyncio.create_task(daily_backup_loop())
     await dp.start_polling(bot)
 
 
